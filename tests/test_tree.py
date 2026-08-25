@@ -156,7 +156,7 @@ def test_dataframe_input_preserves_names():
 def test_rejects_bad_inputs():
     with pytest.raises(ValueError, match="NaN"):
         SegTree().fit(np.array([[1.0, np.nan], [2.0, 3.0]]))
-    with pytest.raises(ValueError, match="NaN|infinite"):
+    with pytest.raises(ValueError, match=r"NaN|infinite"):
         SegTree().fit(np.array([[np.inf, 1.0], [0.0, 1.0]]))
     with pytest.raises(ValueError, match="2-D"):
         SegTree().fit(np.array([1.0, 2.0, 3.0]))

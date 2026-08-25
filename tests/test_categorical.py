@@ -197,11 +197,11 @@ def test_handle_unknown_error_predict_apply_replay():
     tree = SegTree(min_leaf_abs=10, categorical_features=[2], handle_unknown="error").fit(X)
     fresh = np.column_stack([np.zeros((20, 2)), np.full(20, 999.0)])
     for fn in (tree.predict, tree.apply):
-        with pytest.raises(ValueError, match="x2.*999"):
+        with pytest.raises(ValueError, match=r"x2.*999"):
             fn(fresh)
     from segmtree import replay_labels
 
-    with pytest.raises(ValueError, match="x2.*999"):
+    with pytest.raises(ValueError, match=r"x2.*999"):
         replay_labels(tree, fresh)
     # known categories keep working in error mode
     ok = np.column_stack([np.zeros((10, 2)), np.zeros(10)])

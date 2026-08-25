@@ -9,7 +9,7 @@ description = "Interpretable unsupervised decision tree for customer segmentatio
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "The segmtree authors" }]
+authors = [{ name = "Unknownxu1", email = "Unknownxu1@users.noreply.github.com" }]
 keywords = [
     "clustering",
     "decision-tree",
@@ -43,7 +43,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/segmtree/segmtree"
+Homepage = "https://github.com/Unknownxu1/segmtree"
+Repository = "https://github.com/Unknownxu1/segmtree"
+Issues = "https://github.com/Unknownxu1/segmtree/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/segmtree"]
