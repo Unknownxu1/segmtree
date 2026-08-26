@@ -104,23 +104,26 @@ class SegTree(BaseEstimator):
     a segment are similar and every segment is described by a short
     axis-aligned rule chain. No target variable is used.
 
-    Node heterogeneity averages per-feature impurity ratios over all ``m``
-    features::
+    Node heterogeneity is a weighted average of per-feature impurity ratios::
 
-        H(S) = (1/m) * [ sum_continuous,binary Var_f(S)/Var_f(root)
-                       + sum_categorical Gini_f(S)/Gini_f(root) ]
+        H(S) = sum_j( w_j * h_j(S) ) / sum_j(w_j)
 
-    so ``H(root) = 1`` regardless of scale. Continuous and binary features
-    keep the normalized-variance criterion; declared categorical features use
-    Gini impurity of the code distribution, which is invariant to any
-    one-to-one recoding of category labels. The gain of a split into L/R is::
+    where ``w`` is ``feature_weights`` (all ones by default), numeric/binary
+    features contribute ``h_j(S) = Var_j(S)/Var_j(root)`` and categorical
+    features contribute ``h_j(S) = Gini_j(S)/Gini_j(root)``, so
+    ``H(root) = 1`` regardless of scale or weights. Categorical impurity is
+    invariant to any one-to-one recoding of category labels. The gain of a
+    split into L/R is::
 
         Gain = H(S) - (n_L/n_S * H(L) + n_R/n_S * H(R))
 
     Candidate rules: requested quantiles of each continuous feature inside the
-    node, one test at 0.5 for binary features, and �?for categorical features
-    �?membership in subsets of categories. Among all candidates the
-    highest-gain leaf is expanded next (best-first growth).
+    node, one test at 0.5 for binary features, and — for categorical features —
+    membership in subsets of categories (``categorical_splitter="exact"``) or
+    single-category-vs-rest tests (``"one_vs_rest"``). Among all candidates the
+    highest-gain leaf is always expanded next: the frontier lives in a min-heap
+    keyed by *negative* gain, so every pop extracts the current best split
+    (ties broken deterministically by insertion order).
 
     Parameters
     ----------
@@ -156,8 +159,10 @@ class SegTree(BaseEstimator):
         integer counts stay continuous unless listed here. Mutually exclusive
         per column with ``binary_features``.
     max_categories : int, default=12
-        Maximum number of distinct codes allowed per categorical feature
-        (subset enumeration grows as 2^(k-1)).
+        Maximum number of distinct codes enumerated exactly per categorical
+        feature (subset enumeration grows as 2^(k-1)). Only enforced with
+        ``categorical_splitter="exact"``; ``"one_vs_rest"`` accepts any
+        cardinality.
     handle_unknown : {"complement", "error"}, default="complement"
         Policy for category codes unseen during training when predicting.
         ``"complement"`` routes them to the complement side of every
@@ -171,6 +176,25 @@ class SegTree(BaseEstimator):
         Storage precision for continuous/binary columns
         (``numpy.float32`` saves memory on large inputs). Split statistics
         accumulate in float64, and categorical codes are always kept exactly.
+    feature_weights : sequence, dict or None, default=None
+        Per-feature weights ``w_j >= 0`` (not all zero) scaling each column's
+        contribution to heterogeneity and gain. ``None`` means uniform
+        weights (bit-identical to the unweighted code path). A sequence must
+        be 1-D with one finite weight per column; a ``dict`` maps feature
+        names (or DataFrame columns) to weights, missing names default to 1.
+        Zero-weight features may still be *chosen as splitting variables*
+        (acting as proxies for weighted features) — weights influence the
+        heterogeneity/gain accounting only, not split eligibility.
+    max_leaf_nodes : int or None, default=None
+        Hard cap on the total number of leaves. Growth is best-first, so when
+        the cap is reached no further splits are executed and remaining
+        frontier nodes become leaves. ``None`` disables the limit.
+    categorical_splitter : {"exact", "one_vs_rest"}, default="exact"
+        Categorical candidate generation. ``"exact"`` enumerates all
+        canonical subsets (O(2^(k-1)) per node, capped by ``max_categories``);
+        ``"one_vs_rest"`` tests each category alone against the rest (linear
+        in k, supports arbitrarily high cardinality but can miss splits that
+        merge several categories onto one side).
 
     Attributes
     ----------
@@ -199,6 +223,9 @@ class SegTree(BaseEstimator):
         seen during fitting.
     min_leaf_ : int
         Effective minimum segment size used during fitting.
+    feature_weights_ : ndarray of float64, shape (n_features_in_,)
+        Effective per-feature weights in input column order (all ones when
+        ``feature_weights=None``).
     n_samples_in_, n_features_in_ : int
 
     Examples
@@ -230,6 +257,9 @@ class SegTree(BaseEstimator):
         handle_unknown="complement",
         feature_names=None,
         dtype=np.float64,
+        feature_weights=None,
+        max_leaf_nodes=None,
+        categorical_splitter="exact",
     ):
         self.min_gain = min_gain
         self.min_leaf_frac = min_leaf_frac
@@ -242,6 +272,9 @@ class SegTree(BaseEstimator):
         self.handle_unknown = handle_unknown
         self.feature_names = feature_names
         self.dtype = dtype
+        self.feature_weights = feature_weights
+        self.max_leaf_nodes = max_leaf_nodes
+        self.categorical_splitter = categorical_splitter
 
     # ------------------------------------------------------------------ fit
 
@@ -268,6 +301,14 @@ class SegTree(BaseEstimator):
         self._num_feats_ = num_feats
         self._cat_feats_ = cat_feats
         n_num = int(num_feats.size)
+
+        w = self._resolve_feature_weights(names, m)
+        self.feature_weights_ = np.ones(m, dtype=np.float64) if w is None else w
+        self._weighted_ = w is not None
+        if w is not None:
+            self._w_all_ = w
+            self._w_num_ = w[num_feats].copy()
+            self._w_sum_ = float(w.sum())
 
         # Continuous/binary columns are centered for numerical robustness of
         # prefix sums; committed thresholds live in raw space. Categorical
@@ -337,6 +378,8 @@ class SegTree(BaseEstimator):
                 "cut_feat": -1,
                 "cut_thr": 0.0,
                 "cut_cats": None,
+                "cut_gain": 0.0,
+                "cut_n": 0,
                 "left": None,
                 "right": None,
             }
@@ -344,7 +387,11 @@ class SegTree(BaseEstimator):
         root_orders = [np.argsort(self._column_values(j), kind="mergesort") for j in range(m)]
         root = new_node(np.arange(n, dtype=np.intp), 0, [], root_orders)
         root["best"] = self._best_split(root)
-        heap = [(root["best"]["gain"] if root["best"] else 0.0, next(tick), root)]
+        # heapq is a min-heap: keys are NEGATIVE gains so each pop extracts the
+        # frontier node with the highest gain (best-first growth). Ties break
+        # by insertion order via the monotonic tick, keeping runs deterministic.
+        root_key = -(root["best"]["gain"]) if root["best"] else 0.0
+        heap = [(root_key, next(tick), root)]
         cuts, chains = [], []
         labels = np.full(n, -1, dtype=np.intp)
         leaves = []
@@ -353,7 +400,17 @@ class SegTree(BaseEstimator):
         while heap:
             _, _, node = heapq.heappop(heap)
             best = node["best"]
-            if best is None or best["gain"] < self.min_gain:
+            can_split = best is not None and best["gain"] >= self.min_gain
+            if (
+                can_split
+                and self.max_leaf_nodes is not None
+                and len(cuts) >= self.max_leaf_nodes - 1
+            ):
+                # Leaf budget exhausted: every successful split adds exactly one
+                # leaf, so with max_leaf_nodes reached no further split may run;
+                # remaining frontier nodes become ordinary leaves.
+                can_split = False
+            if not can_split:
                 self._finalize_leaf(node, leaves, chains, labels)
                 continue
 
@@ -399,6 +456,8 @@ class SegTree(BaseEstimator):
                     "cut_feat": j,
                     "cut_thr": thr if best["kind"] != "subset" else 0.0,
                     "cut_cats": cats if best["kind"] == "subset" else None,
+                    "cut_gain": float(best["gain"]),
+                    "cut_n": int(node["idx"].size),
                     "left": None,
                     "right": None,
                 }
@@ -413,10 +472,8 @@ class SegTree(BaseEstimator):
             node["left"], node["right"] = nl, nr
             for child in (nl, nr):
                 child["best"] = self._best_split(child)
-                heapq.heappush(
-                    heap,
-                    (child["best"]["gain"] if child["best"] else 0.0, next(tick), child),
-                )
+                cb = child["best"]
+                heapq.heappush(heap, (-(cb["gain"]) if cb else 0.0, next(tick), child))
 
         sizes = np.array([lf.n_samples for lf in leaves], dtype=np.float64)
         hets = np.array([lf.heterogeneity for lf in leaves], dtype=np.float64)
@@ -501,6 +558,113 @@ class SegTree(BaseEstimator):
 
     apply = predict
 
+    # ---------------------------------------------------------------- export
+
+    def _require_fitted(self):
+        if not hasattr(self, "labels_"):
+            raise RuntimeError("This SegTree instance is not fitted yet; call fit() first.")
+
+    @staticmethod
+    def _fmt_threshold(value):
+        value = float(value)
+        if value.is_integer() and abs(value) < 2**53:
+            return str(int(value))
+        return f"{value:g}"
+
+    def _export_node_dict(self, nd):
+        """Recursively convert a fitted internal node into plain-Python dicts."""
+        if nd["leaf"]:
+            lf = self.leaves_[nd["leaf_id"]]
+            conditions = []
+            for name, op, payload in lf.conditions:
+                if op in ("in", "not in"):
+                    conditions.append(
+                        {
+                            "feature": name,
+                            "op": op,
+                            "categories": [int(c) for c in sorted(payload)],
+                        }
+                    )
+                else:
+                    conditions.append({"feature": name, "op": op, "threshold": float(payload)})
+            return {
+                "type": "leaf",
+                "leaf_id": int(nd["leaf_id"]),
+                "depth": int(nd["depth"]),
+                "n_samples": int(lf.n_samples),
+                "fraction": float(lf.fraction),
+                "heterogeneity": float(lf.heterogeneity),
+                "conditions": conditions,
+            }
+        is_subset = nd["cut_cats"] is not None
+        node = {
+            "type": "split",
+            "depth": int(nd["depth"]),
+            "feature": self.feature_names_[nd["cut_feat"]],
+            "feature_index": int(nd["cut_feat"]),
+            "op": "in" if is_subset else "<=",
+            # ``threshold`` is meaningful for numeric splits, ``categories``
+            # for categorical splits; the other field is None (JSON null).
+            "threshold": None if is_subset else float(nd["cut_thr"]),
+            "categories": [int(c) for c in sorted(nd["cut_cats"])] if is_subset else None,
+            "gain": float(nd["cut_gain"]),
+            "n_samples": int(nd["cut_n"]),
+        }
+        node["left"] = self._export_node_dict(nd["left"])
+        node["right"] = self._export_node_dict(nd["right"])
+        return node
+
+    def export_dict(self):
+        """Export the fitted tree as a JSON-serializable nested dict.
+
+        The root split/leaf starts the structure; parent-child relations come
+        from the tree itself, not from cut execution order. Split nodes carry
+        ``type/depth/feature/feature_index/op/threshold/categories/gain/
+        n_samples/left/right``; leaf nodes carry ``type/leaf_id/depth/
+        n_samples/fraction/heterogeneity/conditions``. All numbers are native
+        Python floats/ints and categories are sorted lists, so
+        ``json.dumps(tree.export_dict())`` works out of the box.
+        """
+        self._require_fitted()
+        return self._export_node_dict(self._root_)
+
+    def export_text(self):
+        """Render the fitted tree as a stable, human-readable indented text.
+
+        Each split line shows the left-branch condition plus its gain and
+        sample count; the complementary branch (``>`` / ``not in {...}``) is
+        prefixed on the right subtree's first line. Leaves show their id,
+        size, fraction, depth and heterogeneity.
+        """
+        self._require_fitted()
+        lines = []
+
+        def walk(nd, tag):
+            indent = "    " * nd["depth"]
+            if nd["leaf"]:
+                lf = self.leaves_[nd["leaf_id"]]
+                lines.append(
+                    f"{indent}{tag}leaf #{lf.id}: n={lf.n_samples}"
+                    f" ({lf.fraction:.1%}), depth={lf.depth},"
+                    f" heterogeneity={lf.heterogeneity:.4f}"
+                )
+                return
+            name = self.feature_names_[nd["cut_feat"]]
+            if nd["cut_cats"] is not None:
+                codes = ", ".join(str(int(c)) for c in sorted(nd["cut_cats"]))
+                cond = f"{name} in {{{codes}}}"
+                rtag = f"not in {{{codes}}} "
+            else:
+                ts = self._fmt_threshold(nd["cut_thr"])
+                cond = f"{name} <= {ts}"
+                rtag = f"> {ts} "
+            lines.append(f"{indent}{tag}{cond}  [gain={nd['cut_gain']:.4f}, n={nd['cut_n']}]")
+            walk(nd["left"], "")
+            walk(nd["right"], rtag)
+
+        walk(self._root_, "")
+        return "\n".join(lines)
+
     # --------------------------------------------------------------- helpers
 
     def _check_params(self, m):
@@ -530,6 +694,14 @@ class SegTree(BaseEstimator):
             raise ValueError("max_categories must be an int >= 2.")
         if self.handle_unknown not in ("complement", "error"):
             raise ValueError('handle_unknown must be "complement" or "error".')
+        if self.max_leaf_nodes is not None and (
+            isinstance(self.max_leaf_nodes, bool)
+            or not isinstance(self.max_leaf_nodes, Integral)
+            or self.max_leaf_nodes < 2
+        ):
+            raise ValueError("max_leaf_nodes must be an int >= 2 or None.")
+        if self.categorical_splitter not in ("exact", "one_vs_rest"):
+            raise ValueError('categorical_splitter must be "exact" or "one_vs_rest".')
         dtype = np.dtype(self.dtype) if not isinstance(self.dtype, np.dtype) else self.dtype
         if dtype.kind != "f" or dtype.itemsize not in (4, 8):
             raise ValueError("dtype must be numpy.float32 or numpy.float64.")
@@ -570,6 +742,56 @@ class SegTree(BaseEstimator):
                 raise TypeError(f"Unsupported entry in {kind}_features: {item!r}.")
         return resolved
 
+    def _resolve_feature_weights(self, names, m):
+        """Validate ``feature_weights`` and return a float64 array or ``None``.
+
+        ``None`` keeps the unweighted fast path (bit-identical results). An
+        all-ones explicit spec is also normalized to that fast path so both
+        forms are strictly equivalent to the default behavior.
+        """
+        spec = self.feature_weights
+        if spec is None:
+            return None
+        if isinstance(spec, dict):
+            name_to_idx = {nm: i for i, nm in enumerate(names)}
+            w = np.ones(m, dtype=np.float64)
+            for key, value in spec.items():
+                if isinstance(value, (bool, np.bool_)):
+                    raise TypeError(f"feature_weights[{key!r}] must be a number, not a bool.")
+                if not isinstance(value, Real):
+                    raise TypeError(f"feature_weights[{key!r}] must be a real number.")
+                if key not in name_to_idx:
+                    raise ValueError(
+                        f"feature_weights key {key!r} does not match any feature name."
+                    )
+                w[name_to_idx[key]] = float(value)
+        else:
+            if isinstance(spec, (str, bytes)):
+                raise ValueError("feature_weights must be a 1-D numeric sequence, a dict, or None.")
+            entries = list(spec)
+            if any(isinstance(v, (bool, np.bool_)) for v in entries):
+                raise TypeError("feature_weights must not contain boolean values.")
+            try:
+                w = np.asarray(entries, dtype=np.float64)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"feature_weights must be numeric; got {e}") from e
+            if w.ndim != 1:
+                raise ValueError(
+                    f"feature_weights must be a 1-D sequence with one weight per feature "
+                    f"(got {w.ndim}-D)."
+                )
+            if w.size != m:
+                raise ValueError(f"feature_weights has {w.size} entries but X has {m} features.")
+        if not np.isfinite(w).all():
+            raise ValueError("feature_weights must be finite (no NaN/inf).")
+        if (w < 0).any():
+            raise ValueError("feature_weights must be non-negative.")
+        if not (w > 0).any():
+            raise ValueError("feature_weights must contain at least one positive weight.")
+        if np.all(w == 1.0):
+            return None  # exactly equivalent to the default uniform path
+        return np.array(w, dtype=np.float64, copy=True)
+
     def _resolve_binary_features(self, Xraw, names):
         spec = self.binary_features
         if spec is None:
@@ -603,11 +825,12 @@ class SegTree(BaseEstimator):
                 )
             codes_j = np.rint(col).astype(np.int64)
             uniq = np.unique(codes_j)
-            if uniq.size > self.max_categories:
+            if self.categorical_splitter == "exact" and uniq.size > self.max_categories:
                 raise ValueError(
                     f"Categorical column {names[j]!r} has {uniq.size} distinct codes > "
-                    f"max_categories={self.max_categories}. Group rare levels or use "
-                    "one-hot encoding instead."
+                    f"max_categories={self.max_categories}: exact subset enumeration costs "
+                    f"O(2^(k-1)) per node. Group rare levels, raise max_categories, or set "
+                    f"categorical_splitter='one_vs_rest' for high-cardinality columns."
                 )
             codes[j] = {"column": codes_j, "values": uniq}
         return codes, resolved
@@ -639,16 +862,36 @@ class SegTree(BaseEstimator):
         table = np.bincount(flat, minlength=n_blocks * meta["k"])
         return table.reshape(n_blocks, meta["k"]).astype(np.float64)
 
-    def _combined_heterogeneity(self, num_mean_ratio, cat_sum_ratio):
-        """Combine per-domain mean ratios into H over all m features."""
-        m = self.n_features_in_
-        return (num_mean_ratio * self._n_num_ + cat_sum_ratio) / m
+    def _combined_heterogeneity(self, num_term, cat_term):
+        """Combine the numeric and categorical terms into ``H``.
+
+        Unweighted: ``(mean_numeric * n_num + sum_categorical) / m``.
+        Weighted (callers pass weighted sums for both domains):
+        ``(sum_j w_j * term_j) / sum_j w_j``.
+        """
+        if self._weighted_:
+            return (num_term + cat_term) / self._w_sum_
+        return (num_term * self._n_num_ + cat_term) / self.n_features_in_
+
+    def _num_reduce(self, M, *, axis):
+        """Reduce per-numeric-feature terms along the feature ``axis``.
+
+        Unweighted this is a plain mean; with feature weights it is the
+        weighted sum over that axis (division by the total weight happens in
+        :meth:`_combined_heterogeneity`). ``M`` may hold its feature axis at
+        position 0 or last.
+        """
+        if self._weighted_:
+            ax = axis % M.ndim
+            return M @ self._w_num_ if ax == M.ndim - 1 else self._w_num_ @ M
+        return M.mean(axis=axis)
 
     def _node_cat_ratios_from_idx(self, idx):
         total = 0.0
         for j in self._cat_set_:
             meta = self._cat_meta_[j]
-            total += self._gini_codes(self._cat_codes_[j][idx], meta) / self._root_gini_[j]
+            ratio = self._gini_codes(self._cat_codes_[j][idx], meta) / self._root_gini_[j]
+            total += ratio * self._w_all_[j] if self._weighted_ else ratio
         return total
 
     # ------------------------------------------------------------- splitting
@@ -698,13 +941,17 @@ class SegTree(BaseEstimator):
             if hs is None:
                 # Impurity is row-order invariant, so compute it from this
                 # first gathered matrix instead of gathering twice.
-                num_ratio = float(np.mean(np.var(mat, axis=1) / rv)) if has_num else 0.0
-                cat_sum = sum(
-                    self._gini_codes(self._cat_codes_[cj][rows], self._cat_meta_[cj])
-                    / self._root_gini_[cj]
-                    for cj in self._cat_set_
+                num_term = (
+                    float(self._num_reduce(np.var(mat, axis=1) / rv, axis=0)) if has_num else 0.0
                 )
-                hs = self._combined_heterogeneity(num_ratio, cat_sum)
+                cat_term = 0.0
+                for cj in self._cat_set_:
+                    ratio = (
+                        self._gini_codes(self._cat_codes_[cj][rows], self._cat_meta_[cj])
+                        / self._root_gini_[cj]
+                    )
+                    cat_term += ratio * self._w_all_[cj] if self._weighted_ else ratio
+                hs = self._combined_heterogeneity(num_term, cat_term)
             if has_num:
                 cs[:, 0] = 0.0
                 cs2[:, 0] = 0.0
@@ -726,11 +973,13 @@ class SegTree(BaseEstimator):
                     local = np.searchsorted(meta["codes"], vals)
                     oh = np.zeros((n, meta["k"]))
                     oh[pos_ar, local] = 1.0
+                    wc = self._w_all_[cj] if self._weighted_ else 1.0
                     ccs.append(
                         (
                             np.vstack([np.zeros((1, meta["k"])), np.cumsum(oh, axis=0)]),
                             float(n),
                             self._root_gini_[cj],
+                            wc,
                         )
                     )
 
@@ -767,13 +1016,13 @@ class SegTree(BaseEstimator):
         # children Gini ratios of every categorical column at each candidate
         sum_gL = np.zeros(k.size)
         sum_gR = np.zeros(k.size)
-        for cc, _total_n, gr in ccs:
+        for cc, _total_n, gr, wc in ccs:
             NLc = cc[k]  # (nk, Kc)
             NRc = cc[n][None, :] - NLc
             gL = 1.0 - ((NLc / kf[:, None]) ** 2).sum(axis=1)
             gR = 1.0 - ((NRc / (nf - kf)[:, None]) ** 2).sum(axis=1)
-            sum_gL += gL / gr
-            sum_gR += gR / gr
+            sum_gL += wc * gL / gr
+            sum_gR += wc * gR / gr
         hL = self._combined_heterogeneity(hL_num, sum_gL)
         hR = self._combined_heterogeneity(hR_num, sum_gR)
         gains = hs - (kf / nf) * hL - ((nf - kf) / nf) * hR
@@ -797,63 +1046,71 @@ class SegTree(BaseEstimator):
         nrf = (n - k).astype(np.float64)
         mR = (tot[:, None] - csL) / nrf
         vR = np.maximum((tot2[:, None] - cs2L) / nrf - mR**2, 0.0)
-        return (vL / rv[:, None]).mean(axis=0), (vR / rv[:, None]).mean(axis=0)
+        return self._num_reduce(vL / rv[:, None], axis=0), self._num_reduce(
+            vR / rv[:, None], axis=0
+        )
 
     def _best_cat_split(self, j, rows, scol, tot, tot2, rv, hs, n):
-        """Best category-subset split of a categorical column.
+        """Best categorical split of column ``j`` under ``categorical_splitter``.
 
         Categories form contiguous blocks in ``scol`` (ascending code order).
-        Numeric children statistics come from prefix-sum differences; each
-        categorical column's child Gini comes from contingency tables against
-        the blocks. All 2^(k-1)-1 canonical partitions (smallest code fixed on
-        the right) are scored vectorized in deterministic order.
+        Both splitters share the same scoring machinery: numeric children via
+        prefix-sum block differences, categorical children via contingency
+        tables against the blocks. They differ only in the candidate matrix:
+
+        - ``"exact"``: all canonical partitions (smallest code pinned right),
+          ``2^(k-1)-1`` candidates — exponential in k.
+        - ``"one_vs_rest"``: each category alone vs the complement, k linear
+          candidates built by direct slicing (no enumeration matrix).
         """
         edges = np.flatnonzero(np.diff(scol)) + 1
         bounds = np.concatenate(([0], edges, [n]))
         sizes_i = np.diff(bounds)  # int block sizes
         sizes_f = sizes_i.astype(np.float64)
         k_blocks = sizes_i.size
+        block_codes = scol[bounds[:-1]].astype(np.int64)
+        ovr = self.categorical_splitter == "one_vs_rest"
 
-        half = 1 << (k_blocks - 1)
-        bits = ((np.arange(half)[:, None] >> np.arange(k_blocks - 1)) & 1).astype(np.float64)
-        W = np.concatenate([np.zeros((half, 1)), bits], axis=1)  # block 0 -> right
-        del bits
+        if ovr:  # candidate c puts block c alone on the left; linear in k
+            cand_left = None
+            nL = sizes_f
+        else:  # all canonical partitions (smallest code pinned right)
+            half = 1 << (k_blocks - 1)
+            bits = ((np.arange(half)[:, None] >> np.arange(k_blocks - 1)) & 1).astype(np.float64)
+            cand_left = np.concatenate([np.zeros((half, 1)), bits], axis=1)  # block 0 -> right
+            del bits
+            nL = cand_left @ sizes_f
 
-        nL = W @ sizes_f
         valid = (nL >= self.min_leaf_) & (n - nL >= self.min_leaf_)
         if not valid.any():
             return None
         nL_safe = np.maximum(nL, 1.0)[:, None]
         nR_safe = np.maximum(float(n) - nL, 1.0)[:, None]
-        block_codes = scol[bounds[:-1]].astype(np.int64)
 
-        # numeric children impurity (mean over numeric features)
+        # numeric children impurity (weighted mean over numeric features)
         if self._n_num_:
-            _mat, cs, cs2, _sq = (
-                self._bufs_["mat"][: self._n_num_],
-                self._bufs_["cs"][: self._n_num_, : n + 1],
-                self._bufs_["cs2"][: self._n_num_, : n + 1],
-                self._bufs_["sq"][: self._n_num_],
-            )
+            cs = self._bufs_["cs"][: self._n_num_, : n + 1]
+            cs2 = self._bufs_["cs2"][: self._n_num_, : n + 1]
             bsums = cs[:, bounds[1:]] - cs[:, bounds[:-1]]
             bsqs = cs2[:, bounds[1:]] - cs2[:, bounds[:-1]]
-            SL = W @ bsums.T  # (half, n_num)
-            QL = W @ bsqs.T
+            if ovr:  # direct slices: candidate c selects block c's column
+                SL, QL = bsums.T, bsqs.T
+            else:
+                SL, QL = cand_left @ bsums.T, cand_left @ bsqs.T
             vL = np.maximum(QL / nL_safe - (SL / nL_safe) ** 2, 0.0)
-            hL_num = (vL / rv).mean(axis=1)
+            hL_num = self._num_reduce(vL / rv, axis=-1)
             nRf = float(n) - nL
             vR = np.maximum(
                 (tot2[None, :] - QL) / nRf[:, None] - ((tot[None, :] - SL) / nRf[:, None]) ** 2,
                 0.0,
             )
-            hR_num = (vR / rv).mean(axis=1)
+            hR_num = self._num_reduce(vR / rv, axis=-1)
         else:
-            hL_num = hR_num = np.zeros(half)
+            hL_num = hR_num = np.zeros(nL.size)
 
-        # categorical children impurity via contingency tables
+        # contingency counts of every categorical column against the blocks
         block_ids = np.repeat(np.arange(k_blocks), sizes_i)
-        sum_gL = np.zeros(half)
-        sum_gR = np.zeros(half)
+        cnts = []
         for cj in self._cat_set_:
             meta = self._cat_meta_[cj]
             if cj == j:
@@ -864,24 +1121,32 @@ class SegTree(BaseEstimator):
             else:
                 vals = self._XcT_cat_[meta["pos"]][rows]
                 cnt = self._cat_counts_by_block(vals, meta, block_ids, k_blocks)
-            NL = W @ cnt  # (half, k)
+            cnts.append(cnt)
+
+        sum_gL = np.zeros(nL.size)
+        sum_gR = np.zeros(nL.size)
+        for cj, cnt in zip(self._cat_set_, cnts):
+            NL = cnt if ovr else cand_left @ cnt  # (n_cand, k)
             NR = cnt.sum(axis=0)[None, :] - NL
             gL = 1.0 - ((NL / nL_safe) ** 2).sum(axis=1)
-            nR_safe = np.maximum(float(n) - nL, 1.0)[:, None]
             gR = 1.0 - ((NR / nR_safe) ** 2).sum(axis=1)
             gr = self._root_gini_[cj]
-            sum_gL += gL / gr
-            sum_gR += gR / gr
+            wc = self._w_all_[cj] if self._weighted_ else 1.0
+            sum_gL += wc * gL / gr
+            sum_gR += wc * gR / gr
 
+        nf = float(n)
         hL = self._combined_heterogeneity(hL_num, sum_gL)
         hR = self._combined_heterogeneity(hR_num, sum_gR)
-        gains = hs - (nL / n) * hL - ((float(n) - nL) / n) * hR
+        gains = hs - (nL / nf) * hL - ((nf - nL) / nf) * hR
         gains[~valid] = -np.inf
         local = int(np.argmax(gains))
         if not np.isfinite(gains[local]):
             return None
-        left_blocks = np.flatnonzero(W[local])
-        cats = frozenset(int(block_codes[c]) for c in left_blocks)
+        if ovr:
+            cats = frozenset((int(block_codes[local]),))
+        else:
+            cats = frozenset(int(block_codes[c]) for c in np.flatnonzero(cand_left[local]))
         return {
             "gain": float(gains[local]),
             "feat": j,
@@ -896,7 +1161,9 @@ class SegTree(BaseEstimator):
         node["n"] = int(node["idx"].size)
         idx = node["idx"]
         num_ratio = (
-            float(np.mean(np.var(self._XcT_num_[:, idx], axis=1) / self._root_var_))
+            float(
+                self._num_reduce(np.var(self._XcT_num_[:, idx], axis=1) / self._root_var_, axis=0)
+            )
             if self._n_num_
             else 0.0
         )

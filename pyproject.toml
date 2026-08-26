@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "segmtree"
-version = "0.3.0"
+version = "0.4.0"
 description = "Interpretable unsupervised decision tree for customer segmentation and rule-based clustering."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -55,7 +55,7 @@ include = [
     "src",
     "tests",
     "README.md",
-    "README.zh-CN.md",
+    "README.en.md",
     "CHANGELOG.md",
     "LICENSE",
 ]

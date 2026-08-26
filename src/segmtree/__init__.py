@@ -11,7 +11,7 @@ from .rules import Condition, Rule, extract_rules, profile_leaves, replay_check,
 from .stability import StabilityResult, adjusted_rand_score, bootstrap_stability
 from .tree import Cut, Leaf, SegTree
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Condition",
