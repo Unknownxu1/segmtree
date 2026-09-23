@@ -7,7 +7,7 @@ import json
 import numpy as np
 import pytest
 
-from segmtree import SegTree
+from segmtree import NotFittedError, SegTree
 
 
 def make_export_data():
@@ -52,11 +52,11 @@ def _leaves(node):
     return [n for n in _walk(node) if n["type"] == "leaf"]
 
 
-def test_unfitted_raises_runtime_error():
+def test_unfitted_raises_not_fitted_error():
     tree = SegTree()
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         tree.export_dict()
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         tree.export_text()
 
 
@@ -64,7 +64,7 @@ def test_export_dict_is_json_serializable_with_native_types(fitted):
     d = fitted.export_dict()
     dumped = json.dumps(d)  # must not raise (no NaN/np types inside)
     reloaded = json.loads(dumped)
-    assert reloaded == json.loads(json.dumps(reloaded))  # sanity round-trip
+    assert reloaded == d  # round-trip preserves structure exactly
     for node in _walk(d):
         for _key, value in node.items():
             if isinstance(value, list):

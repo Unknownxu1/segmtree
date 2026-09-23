@@ -100,9 +100,9 @@ def test_rules_replay_after_recoding(base_tree):
             out.add(tuple(key))
         return out
 
-    base_rules = {(lf.id): lf.conditions for lf in tree.leaves_}
-    assert len(base_rules) == len(extract_rules(tp)) or True  # structural freedom
-    assert rule_sets(extract_rules(tp))  # smoke: extraction works on recoded fit
+    base_rules = extract_rules(tree)
+    assert len(base_rules) == len(extract_rules(tp))
+    assert rule_sets(extract_rules(tp))  # extraction works on recoded fit
 
 
 def test_exact_agreement_with_reference_on_nominal_data():

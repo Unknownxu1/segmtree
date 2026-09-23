@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from segmtree import SegTree, adjusted_rand_score, bootstrap_stability
+from segmtree import NotFittedError, SegTree, adjusted_rand_score, bootstrap_stability
 
 
 def test_ari_matches_sklearn():
@@ -49,7 +49,7 @@ def test_stability_deterministic_given_seed(mixed_x, mixed_params):
 def test_stability_input_validation():
     tree = SegTree(min_leaf_abs=5)
     X = np.zeros((20, 2))
-    with pytest.raises(RuntimeError, match="fitted"):
+    with pytest.raises(NotFittedError, match="fitted"):
         bootstrap_stability(tree, X)
 
     train = np.r_[np.zeros((10, 2)), np.ones((10, 2)) * 5]

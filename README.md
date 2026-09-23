@@ -13,7 +13,7 @@ k-means / GMM 做不到的。
 | | k-means / GMM | segmtree |
 |---|---|---|
 | 人群定义 | 质心坐标 | `income > 50k AND is_active = 0` 式规则 |
-| 新样本归类 | 最近质心 | 至多几条阈值判断即可回放 |
+| 新样本归类 | 最近质心 | 每条规则链仅几次阈值/成员判断 |
 | 二值 + 连续混合特征 | 需要各种缩放技巧 | 归一化后同口径比较 |
 | 内置自检 | 无 | 收益可加性 + 规则回放一致性校验 |
 | 稳定性评估 | 自己想办法 | 一行调用的 Bootstrap ARI |
@@ -50,7 +50,7 @@ print(f"{tree.n_leaves_} 类人群，异质性降低 {tree.reduction_:.0%}")
 for rule in extract_rules(tree):
     print(rule)                      # #0: x1 <= -1.24 AND x0 <= 1.83 ...
 
-profile_leaves(tree, X, top_k=3)     # 每类与全体差异最大的特征（z 分数）
+profile_leaves(tree, X, top_k=3)     # LeafProfile：z 分数画像 + category_enrichment
 replay_check(tree, X)                # True：规则回放与 predict 完全一致
 bootstrap_stability(tree, X, n_replicates=12, random_state=0).mean   # 例如 0.98
 ```
@@ -131,24 +131,26 @@ tree = SegTree(feature_weights={"income": 4.0, "churn_flag": 2.0}).fit(df)
 权重缩放各列对异质性与收益的贡献——它并不禁止在零权重列上切分：只要零权重列能很好
 地分开其他被加权的特征，仍可作为代理变量被选中。
 
-## 导出拟合好的树
+## 导出与持久化
 
 ```python
-d = tree.export_dict()      # 可直接 JSON 序列化的嵌套 dict
-import json; json.dumps(d)  # 开箱即用
+d = tree.export_dict()        # 可直接 JSON 序列化的嵌套 dict
+import json; json.dumps(d)    # 开箱即用
 
-print(tree.export_text())   # 缩进文本：分支条件、gain、样本数、叶子编号
+print(tree.export_text())     # 缩进文本：分支条件、gain、样本数、叶子编号
+print(tree.export_graphviz()) # Graphviz DOT 字符串（零依赖）
+
+tree2 = SegTree.from_dict(d)  # 从 export_dict 重建可 predict 的树
 ```
 
 split 节点包含 `feature/feature_index/op/threshold|categories/gain/n_samples/
 left/right`；leaf 节点包含 `leaf_id/n_samples/fraction/heterogeneity/conditions`。
-不暴露任何私有对象。想出图可自行把 dict 转成 graphviz 等格式（segmtree 不引入
-额外运行时依赖），README 英文版附有转换示例。
+不暴露任何私有对象。`from_dict` 可完整还原预测能力，适合把规则部署到生产评分端。
 
 ## API 一览
 
 ```python
-SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=50, max_depth=None,
+SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=10, max_depth=None,
         quantiles=8, binary_features="auto", categorical_features=None,
         max_categories=12, handle_unknown="complement", feature_names=None,
         dtype=np.float64, feature_weights=None, max_leaf_nodes=None,
@@ -158,13 +160,18 @@ SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=50, max_depth=None,
 | 成员 | 用途 |
 |---|---|
 | `.fit(X)` / `.fit_predict(X)` / `.predict(X)` | sklearn 风格训练与归类 |
+| `.score(X)` | 异质性降低比例（可直接用于 `GridSearchCV`） |
+| `.transform(X)` | 叶编号 one-hot 编码（Pipeline 中间步骤） |
+| `.apply(X)` | 叶编号（sklearn `apply` 约定） |
 | `.labels_`, `.n_leaves_`, `.leaves_`, `.cuts_` | 拟合结构 |
 | `.reduction_`, `.h_avg_`, `.total_gain_`, `.summary()` | 质量统计 |
+| `.feature_importances_` | 按特征归一化的切分收益 |
 | `.feature_weights_` | 生效的逐特征权重 |
-| `.export_dict()` / `.export_text()` | 公开树导出（JSON 安全 dict / 文本） |
+| `.export_dict()` / `.export_text()` / `.export_graphviz()` | 公开树导出 |
+| `SegTree.from_dict(d)` | 从 `export_dict` 重建可 predict 的树 |
 | `extract_rules(tree)` | 返回 `Rule` 列表（`str(rule)` 即规则链文本） |
 | `replay_labels(tree, X)` / `replay_check(tree, X)` | 规则回放校验 |
-| `profile_leaves(tree, X, top_k=3)` | 每类 z 分数画像 |
+| `profile_leaves(tree, X, top_k=3)` | 每类 `LeafProfile` 画像 |
 | `bootstrap_stability(tree, X, ...)` | Bootstrap ARI（mean/std） |
 | `adjusted_rand_score(a, b)` | 纯 numpy 实现的 ARI |
 
@@ -173,7 +180,7 @@ SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=50, max_depth=None,
 - 想要更少、更大的人群 → 提高 `min_gain`（如 0.02~0.05）、减少 `quantiles`；
   已知目标人群数时**直接设 `max_leaf_nodes`**；
 - 规则想更短、结果想更稳 → 设 `max_depth`（4~6）；
-- 小数据集（< 5000 行）→ 降低 `min_leaf_abs`（默认 50 是为大数据设的下限）；
+- 小数据集（< 500 行）→ 可进一步降低 `min_leaf_abs`（默认 10）；
 - 有业务侧重点 → 用 `feature_weights` 强调关键列，而不是删掉其余特征；
 - Bootstrap ARI 偏低 → 通常减少分位数、提高 `min_gain`、限深或限叶数即可稳定结构。
 
@@ -190,8 +197,9 @@ SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=50, max_depth=None,
 ```bash
 git clone <your-fork-url> && cd segmtree
 pip install -e .[dev]
-pytest            # 运行测试
-ruff check src tests
+pytest                       # 运行测试
+ruff check src tests         # lint
+ruff format --check src tests  # 格式
 ```
 
 ## 许可证

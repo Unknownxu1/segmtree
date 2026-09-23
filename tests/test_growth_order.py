@@ -17,28 +17,7 @@ import pytest
 
 from segmtree import SegTree, adjusted_rand_score
 from tests._naive_reference import NaiveSegTree
-
-
-def asymmetric_data():
-    """Root split is strong; afterwards the LEFT child hides a much stronger
-    second split than the RIGHT child's weak one.
-
-    A correct best-first pass must cut the left child before the right one;
-    the old worst-first bug popped the weaker child first.
-    """
-    rng = np.random.default_rng(0)
-    n = 800
-    half = n // 2
-    quarter = n // 4
-    x0 = np.r_[np.zeros(half), np.full(n - half, 10.0)]  # root splitter
-    x1 = np.r_[np.zeros(quarter), np.full(quarter, 8.0), np.full(n - half, 3.0)]
-    x1 += rng.normal(0, 0.1, n)  # strong structure inside the LEFT cluster only
-    x2 = np.r_[np.full(half, 0.5), np.zeros(quarter), np.full(quarter, 1.6)]
-    x2 += rng.normal(0, 0.05, n)  # deliberately weak structure on the RIGHT
-    return np.column_stack([x0, x1, x2])
-
-
-STRONG_PARAMS = dict(min_gain=0.02, min_leaf_abs=50, min_leaf_frac=0.01, quantiles=6)
+from tests.conftest import STRONG_PARAMS, asymmetric_data
 
 
 def test_second_cut_is_the_strongest_frontier_split():

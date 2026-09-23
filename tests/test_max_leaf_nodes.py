@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from segmtree import SegTree, replay_check
-from tests.test_growth_order import STRONG_PARAMS, asymmetric_data
+from tests.conftest import STRONG_PARAMS, asymmetric_data, make_mixed_cat
 
 
 @pytest.fixture()
@@ -85,8 +85,6 @@ def test_deterministic_at_the_limit(rich_tree_data):
 
 
 def test_cap_with_categorical_rules_replay_and_additivity():
-    from tests.test_feature_weights import make_mixed_cat
-
     X = make_mixed_cat()
     params = dict(
         min_gain=0.02,

@@ -3,7 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from segmtree import SegTree, extract_rules, profile_leaves, replay_check, replay_labels
+from segmtree import (
+    NotFittedError,
+    SegTree,
+    extract_rules,
+    profile_leaves,
+    replay_check,
+    replay_labels,
+)
 
 
 @pytest.fixture()
@@ -49,11 +56,11 @@ def test_replay_matches_predict_on_fresh_points(fitted):
 def test_profiles_structure(fitted, mixed_x):
     profiles = profile_leaves(fitted, mixed_x, top_k=3)
     assert len(profiles) == fitted.n_leaves_
-    total = sum(p["fraction"] for p in profiles)
+    total = sum(p.fraction for p in profiles)
     assert abs(total - 1.0) < 1e-9
     for p in profiles:
-        assert len(p["top_features"]) == 3
-        names, zs = zip(*p["top_features"])
+        assert len(p.top_features) == 3
+        names, zs = zip(*p.top_features)
         assert all(isinstance(nm, str) for nm in names)
         order = np.argsort(-np.abs(zs))
         assert list(order) == [0, 1, 2]  # sorted by descending |z|
@@ -61,11 +68,11 @@ def test_profiles_structure(fitted, mixed_x):
 
 def test_unfitted_tree_raises():
     tree = SegTree()
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         extract_rules(tree)
     X = np.zeros((10, 2))
     for fn in (replay_labels, replay_check):
-        with pytest.raises(RuntimeError, match="not fitted"):
+        with pytest.raises(NotFittedError, match="not fitted"):
             fn(tree, X)
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         profile_leaves(tree, X)

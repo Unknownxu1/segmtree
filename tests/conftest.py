@@ -42,3 +42,37 @@ def mixed_params():
 def mixed_x(mixed):
     """Feature matrix only."""
     return mixed[0]
+
+
+def asymmetric_data():
+    """Root split is strong; afterwards the LEFT child hides a much stronger
+    second split than the RIGHT child's weak one.
+    """
+    rng = np.random.default_rng(0)
+    n = 800
+    half = n // 2
+    quarter = n // 4
+    x0 = np.r_[np.zeros(half), np.full(n - half, 10.0)]
+    x1 = np.r_[np.zeros(quarter), np.full(quarter, 8.0), np.full(n - half, 3.0)]
+    x1 += rng.normal(0, 0.1, n)
+    x2 = np.r_[np.full(half, 0.5), np.zeros(quarter), np.full(quarter, 1.6)]
+    x2 += rng.normal(0, 0.05, n)
+    return np.column_stack([x0, x1, x2])
+
+
+STRONG_PARAMS = dict(min_gain=0.02, min_leaf_abs=50, min_leaf_frac=0.01, quantiles=6)
+
+
+def make_mixed_cat(n_per_group=200, seed=3):
+    """Three latent groups over 2 continuous + 1 binary + 1 categorical col."""
+    rng = np.random.default_rng(seed)
+    centers = [[0.0, 0.0], [6.0, 6.0], [-6.0, 6.0]]
+    parts = []
+    for k, center in enumerate(centers):
+        cont = rng.normal(center, 0.5, (n_per_group, 2))
+        flag = (rng.random((n_per_group, 1)) < 0.1 + 0.4 * k).astype(float)
+        code = np.full(n_per_group, k, dtype=float)
+        flip = rng.random(n_per_group) < 0.15
+        code[flip] = rng.integers(0, 3, int(flip.sum()))
+        parts.append(np.hstack([cont, flag, code[:, None]]))
+    return np.vstack(parts)

@@ -3,46 +3,73 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ._base import as_2d_array
+from ._base import as_2d_array, check_is_fitted
 from .tree import SegTree
+
+if TYPE_CHECKING:  # pragma: no cover
+    from numpy.typing import ArrayLike, NDArray
 
 __all__ = ["StabilityResult", "adjusted_rand_score", "bootstrap_stability"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class StabilityResult:
     """Bootstrap stability of a segmentation.
 
     ``scores[i]`` is the Adjusted Rand Index between the original partition
     and the partition induced on the full data by a tree refit on bootstrap
     replicate ``i``. Values above ~0.7 indicate a stable structure.
+
+    ``__eq__`` and ``__hash__`` compare ``scores`` element-wise because the
+    default dataclass behaviour is undefined for ndarray fields.
     """
 
-    scores: np.ndarray
+    scores: NDArray[np.float64]
     mean: float
     std: float
     n_replicates: int
 
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, StabilityResult):
+            return NotImplemented
+        return (
+            self.mean == other.mean
+            and self.std == other.std
+            and self.n_replicates == other.n_replicates
+            and np.array_equal(self.scores, other.scores)
+        )
 
-def adjusted_rand_score(labels_a, labels_b):
+    def __hash__(self) -> int:
+        return hash((self.mean, self.std, self.n_replicates, self.scores.tobytes()))
+
+
+def adjusted_rand_score(labels_a: ArrayLike, labels_b: ArrayLike) -> float:
     """Adjusted Rand Index between two labelings (pure numpy).
 
-    Matches :func:`sklearn.metrics.adjusted_rand_score` numerically; provided
-    to keep the package dependency-free.
+    Matches :func:`sklearn.metrics.adjusted_rand_score` numerically,
+    including degenerate cases (empty input raises; a single sample or
+    identical trivial partitions return 1.0).
     """
     a = np.asarray(labels_a).ravel()
     b = np.asarray(labels_b).ravel()
     if a.shape[0] != b.shape[0]:
         raise ValueError("Label arrays must have the same length.")
+    n = int(a.shape[0])
+    if n == 0:
+        raise ValueError("Label arrays must not be empty.")
+    if n == 1:
+        return 1.0
     _, ai = np.unique(a, return_inverse=True)
     _, bi = np.unique(b, return_inverse=True)
-    na, nb, n = int(ai.max()) + 1, int(bi.max()) + 1, a.shape[0]
+    na, nb = int(ai.max()) + 1, int(bi.max()) + 1
     contingency = np.bincount(ai * nb + bi, minlength=na * nb).astype(np.int64).reshape(na, nb)
 
-    def comb2(x):
+    def comb2(x: float | NDArray[np.float64]) -> float | NDArray[np.float64]:
         return x * (x - 1) // 2
 
     sum_comb = comb2(contingency.astype(np.float64)).sum()
@@ -56,28 +83,43 @@ def adjusted_rand_score(labels_a, labels_b):
     return float((sum_comb - expected) / denom)
 
 
-def bootstrap_stability(tree, X, *, n_replicates=12, random_state=None):
+def bootstrap_stability(
+    tree: SegTree,
+    X: ArrayLike,
+    *,
+    n_replicates: int = 12,
+    random_state: int | np.random.Generator | None = None,
+) -> StabilityResult:
     """Refit the tree on bootstrap resamples and measure agreement with the fit.
 
     Parameters
     ----------
     tree : SegTree
-        A fitted tree; its hyperparameters are reused for every replicate.
+        A fitted tree whose hyperparameters are reused for every replicate.
     X : array-like, shape (n_samples, n_features)
         The training matrix used to fit ``tree``.
     n_replicates : int, default=12
-        Number of bootstrap replicates.
-    random_state : int or None, default=None
-        Seed for reproducibility.
+        Number of bootstrap replicates (>= 1).
+    random_state : int, numpy Generator or None, default=None
+        Seed or generator for reproducibility.
 
     Returns
     -------
     StabilityResult
+
+    Notes
+    -----
+    When ``tree.handle_unknown == "error"``, bootstrap resamples may omit
+    rare category codes and the full-data prediction step can then raise.
+    Use ``handle_unknown="complement"`` (the default) for stability
+    assessment on data with rare categories.
     """
-    if not hasattr(tree, "labels_"):
-        raise RuntimeError("tree must be fitted before calling bootstrap_stability().")
-    if isinstance(n_replicates, bool) or not isinstance(n_replicates, int) or n_replicates < 1:
+    check_is_fitted(tree)
+    if isinstance(n_replicates, bool) or not isinstance(n_replicates, Integral):
         raise ValueError("n_replicates must be an int >= 1.")
+    if int(n_replicates) < 1:
+        raise ValueError("n_replicates must be an int >= 1.")
+    n_replicates = int(n_replicates)
     Xarr, _ = as_2d_array(X, context="X")
     if Xarr.shape != (tree.n_samples_in_, tree.n_features_in_):
         raise ValueError(

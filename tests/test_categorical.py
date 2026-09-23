@@ -192,7 +192,6 @@ def test_handle_unknown_complement_default_and_replay():
 
 
 def test_handle_unknown_error_predict_apply_replay():
-    pytest.importorskip("numpy")
     X, _ = make_cat_data(k=3)
     tree = SegTree(min_leaf_abs=10, categorical_features=[2], handle_unknown="error").fit(X)
     fresh = np.column_stack([np.zeros((20, 2)), np.full(20, 999.0)])
@@ -224,10 +223,10 @@ def test_profile_enriches_categorical_columns():
         min_leaf_abs=15, categorical_features=[2], feature_names=["f0", "f1", "tier", "noise"]
     ).fit(X)
     profiles = profile_leaves(tree, X, top_k=3)
-    assert any(p["category_enrichment"] for p in profiles)
+    assert any(p.category_enrichment for p in profiles)
     for p in profiles:
-        names_in_top = [nm for nm, _ in p["top_features"]]
+        names_in_top = [nm for nm, _ in p.top_features]
         assert "tier" not in names_in_top, "categorical column must not be z-scored"
-        for fname, code, share, lift in p["category_enrichment"]:
+        for fname, code, share, lift in p.category_enrichment:
             assert isinstance(fname, str) and isinstance(code, int)
             assert 0.05 <= share <= 1.0 and lift > 1.0

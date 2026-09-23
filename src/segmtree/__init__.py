@@ -7,16 +7,28 @@ human-readable rule chains, without any target variable. See
 
 from __future__ import annotations
 
-from .rules import Condition, Rule, extract_rules, profile_leaves, replay_check, replay_labels
+from ._base import NotFittedError
+from .rules import (
+    Condition,
+    LeafProfile,
+    Rule,
+    extract_rules,
+    profile_leaves,
+    replay_check,
+    replay_labels,
+    rule_mask,
+)
 from .stability import StabilityResult, adjusted_rand_score, bootstrap_stability
 from .tree import Cut, Leaf, SegTree
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "Condition",
     "Cut",
     "Leaf",
+    "LeafProfile",
+    "NotFittedError",
     "Rule",
     "SegTree",
     "StabilityResult",
@@ -27,4 +39,5 @@ __all__ = [
     "profile_leaves",
     "replay_check",
     "replay_labels",
+    "rule_mask",
 ]

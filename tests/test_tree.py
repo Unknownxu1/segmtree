@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from segmtree import SegTree, adjusted_rand_score, extract_rules
+from segmtree import NotFittedError, SegTree, adjusted_rand_score, extract_rules
 
 
 def test_basic_fit_shapes_and_labels(blobs):
@@ -167,7 +167,7 @@ def test_rejects_bad_inputs():
 
 
 def test_predict_before_fit_raises():
-    with pytest.raises(RuntimeError, match="not fitted"):
+    with pytest.raises(NotFittedError, match="not fitted"):
         SegTree().predict(np.zeros((3, 2)))
 
 
@@ -218,7 +218,7 @@ def test_sklearn_compat_clone_and_grid():
 def test_summary_dict(blobs):
     tree = SegTree(min_leaf_abs=30).fit(blobs)
     info = tree.summary()
-    assert info["n_samples"] == 600 and info["n_segments"] == tree.n_leaves_
+    assert info["n_samples"] == 600 and info["n_leaves"] == tree.n_leaves_
     assert info["n_splits"] == len(tree.cuts_)
     assert info["depth_max"] <= info["n_splits"]
 
@@ -228,8 +228,6 @@ def test_heldout_points_lands_in_correct_region(blobs):
     rng = np.random.default_rng(99)
     fresh = np.vstack([rng.normal(0, 0.4, (50, 2)), rng.normal(6, 0.4, (50, 2))])
     pred = tree.predict(fresh)
-    top_sizes = sorted(lf.n_samples for lf in tree.leaves_)[-2:]
-    {s for s in top_sizes}
     counts = np.bincount(pred, minlength=tree.n_leaves_)
     dominant = sum(s for s in counts if s > 25)
     assert dominant >= 80  # most fresh points fall into the two big segments

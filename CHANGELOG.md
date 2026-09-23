@@ -1,5 +1,106 @@
 # Changelog
 
+## 0.5.0 — 2026-09-23
+
+### Fixed
+
+- **Single-value categorical column no longer crashes** (`ZeroDivisionError`):
+  root Gini is now clamped to a small epsilon; a column with one unique code
+  is treated as constant.
+- **Negative / very large category codes handled exactly**: Gini computation
+  now uses `searchsorted` local codes instead of raw `bincount`, so codes like
+  `pd.factorize`'s `-1` or values near `2^63` work correctly without
+  massive allocations.
+- **`float32` mode: `predict(X_train)` now equals `labels_`**: prediction-side
+  threshold comparisons cast input to the stored `dtype`, eliminating
+  boundary drift.  `replay_check` was also masking this — now consistent.
+- **Complex input rejected** with a clear `TypeError` instead of silently
+  discarding the imaginary part.
+- **Masked arrays rejected** (mask was silently ignored).
+- `adjusted_rand_score([0], [0])` now returns `1.0` (was `NaN`); empty input
+  raises `ValueError`.
+- `min_gain=nan` and `min_gain=True` now rejected by parameter validation
+  (were silently accepted, producing degenerate trees).
+- `replay_labels` validates feature count (was silently returning garbage on
+  width mismatch).
+- `Condition` validates op/payload consistency (finite threshold for `<=`/`>`,
+  non-empty categories for `in`/`not in`).
+- `profile_leaves` validates `top_k >= 1`.
+- `binary_features`/`categorical_features` reject scalar values with a clear
+  `TypeError` (was `'int' object is not iterable`).
+- `quantiles=8.0` (float scalar) gives a targeted error message.
+- `_resolve_sequence_spec` raises `ValueError` (not `KeyError`/`IndexError`).
+
+### Changed
+
+- **`min_leaf_abs` default lowered from 50 to 10** — the old default silently
+  produced a single leaf on datasets under ~5000 rows.  Override explicitly
+  for large-scale use.
+- **Not-fitted errors are now `NotFittedError`** (sklearn-compatible,
+  inherits `ValueError` + `AttributeError`) instead of `RuntimeError`.
+- `profile_leaves` returns `LeafProfile` dataclass instances (attribute
+  access) instead of dicts.
+- `summary()` keys renamed: `n_segments`→`n_leaves`,
+  `heterogeneity_reduction`→`reduction`, `segment_size_*`→`leaf_size_*`.
+- `export_dict()` now includes a `_meta` key on the root node with feature
+  names, `handle_unknown`, category sets etc. so `from_dict` can fully
+  reconstruct the tree.  Existing keys are unchanged.
+- `feature_names_in_` (ndarray, sklearn convention) added alongside
+  `feature_names_` (list).
+- `replay_labels` raises `ValueError` on unknown feature names in rules
+  (was bare `KeyError`).
+- `StabilityResult` custom `__eq__`/`__hash__` that handle ndarray fields.
+- `n_replicates` accepts any `Integral` (was `int`-only).
+
+### New
+
+- **`score(X, y=None)`** — heterogeneity reduction of `X` under the fitted
+  partition; plugs directly into `GridSearchCV`/`cross_val_score`.
+- **`from_dict(data)`** classmethod — rebuild a predict-capable tree from
+  `export_dict()` output (deploy rules to production without pickling).
+- **`transform(X)`** / **`fit_transform(X)`** — one-hot leaf encoding for
+  Pipeline intermediate steps.
+- **`export_graphviz()`** — zero-dependency Graphviz DOT export.
+- **`feature_importances_`** — normalized split gain per feature (sklearn
+  convention).
+- **`sample_weight`** parameter on `fit`/`fit_predict`/`fit_transform` —
+  per-row weights scaling impurity and gain.  `None` (default) is
+  bit-identical to the previous unweighted path.
+- `apply(X)` is now a real method with its own docstring (was a bare alias).
+- Method-level wrappers: `tree.extract_rules()`, `tree.replay_check(X)`,
+  `tree.replay_labels(X)`, `tree.profile_leaves(X)`,
+  `tree.bootstrap_stability(X)` (thin delegates to the free functions).
+- `rule_mask` exported from the package top level.
+- `LeafProfile` dataclass exported.
+- `NotFittedError` exported.
+- `py.typed` (PEP 561) — downstream type checkers now see the annotations.
+- Full type annotations on all public API.
+- `Condition`/`Cut`/`Leaf`/`Rule`/`StabilityResult` documented with numpydoc.
+
+### Performance
+
+- Categorical-split evaluation no longer builds unused one-hot prefix sums
+  (was O(n·Σk) wasted per categorical split candidate).
+- `j → numeric row` mapping precomputed at fit (was O(n_num) scan per
+  feature per node).
+- Exact categorical subset enumeration refuses > 1M candidate subsets with
+  a clear error (was silently allocating multi-GB matrices).
+- `_fmt`/`format_threshold` de-duplicated into `_base`.
+
+### Testing
+
+- 34 new regression tests for edge cases, new API, and previously uncovered
+  branches (negative codes, single-value categories, float32 consistency,
+  complex/masked rejection, ARI edge cases, pickle round-trip,
+  `from_dict` round-trip, `score`, `transform`, `feature_importances_`,
+  `sample_weight`, column-order alignment, etc.).
+- Fixed 3 fake/dead assertions (`or True`, self-comparison, dead set
+  construction).
+- Data factories consolidated into `conftest.py` (test modules no longer
+  import from each other).
+- CI: `pytest-cov`, `--doctest-modules`, pure-numpy-only job, Python 3.14.
+- Release workflow gated on tests + version-tag consistency check.
+
 ## 0.4.0 — 2026-08-26
 
 - **Fixed: true best-first growth (heap-key bug)**. The frontier min-heap was

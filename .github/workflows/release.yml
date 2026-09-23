@@ -5,17 +5,44 @@ on:
     tags: ["v*"]
 
 permissions:
+  contents: read
   id-token: write
 
 jobs:
-  publish:
+  verify:
     runs-on: ubuntu-latest
-    environment: pypi
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install build
+          cache: pip
+      - name: Check tag matches package version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(python -c "import re,pathlib; t=pathlib.Path('src/segmtree/__init__.py').read_text(); print(re.search(r'__version__\s*=\s*\"(.+?)\"', t).group(1))")
+          echo "tag=$TAG  package=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag v$TAG does not match __version__ $PKG"
+            exit 1
+          fi
+      - run: pip install -e .[dev]
+      - run: pytest
+      - run: pip install build twine
       - run: python -m build
+      - run: twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1

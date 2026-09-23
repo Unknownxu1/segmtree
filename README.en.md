@@ -16,7 +16,7 @@ give you.
 | | k-means / GMM | segmtree |
 |---|---|---|
 | Segment definition | centroid coordinates | `income > 50k AND is_active = 0` style rules |
-| New-row assignment | nearest centroid | evaluate ≤ 6 threshold tests |
+| New-row assignment | nearest centroid | a few threshold/membership tests per rule chain |
 | Mixed binary + continuous features | needs scaling tricks | one normalized criterion for both |
 | Built-in self-checks | none | gain additivity + rule replay verification |
 | Stability assessment | ad hoc | one-call bootstrap ARI |
@@ -158,41 +158,28 @@ Weights scale each column's contribution to heterogeneity and gain — they do
 not forbid splits on zero-weight columns, which may still be selected as
 proxies that separate the weighted features well.
 
-## Exporting a fitted tree
+## Exporting and persistence
 
 ```python
-d = tree.export_dict()      # JSON-serializable nested dict
-import json; json.dumps(d)  # works out of the box
+d = tree.export_dict()        # JSON-serializable nested dict
+import json; json.dumps(d)    # works out of the box
 
-print(tree.export_text())   # indented listing with gains, n and leaf ids
+print(tree.export_text())     # indented listing with gains, n and leaf ids
+print(tree.export_graphviz()) # Graphviz DOT string (zero dependencies)
+
+tree2 = SegTree.from_dict(d)  # rebuild a predict-capable tree from the dict
 ```
 
 Split nodes carry `feature/feature_index/op/threshold|categories/gain/
 n_samples/left/right`; leaves carry `leaf_id/n_samples/fraction/heterogeneity/
-conditions`. No private objects are exposed. To render graphics, convert the
-dict — no extra dependency ships with segmtree:
-
-```python
-def to_graphviz(node, lines):     # sketch: pip install graphviz separately
-    if node["type"] == "split":
-        label = f"{node['feature']} <= {node['threshold']}" if node["op"] == "<=" \
-            else f"{node['feature']} in {node['categories']}"
-        lines.append(f'"{id(node)}" [label="{label}"];')
-        for child in (node["left"], node["right"]):
-            lines.append(f'"{id(node)}" -> "{id(child)}";')
-            to_graphviz(child, lines)
-    else:
-        lines.append(
-            f'"{id(node)}" [shape=box, label="leaf #{node["leaf_id"]} n={node["n_samples"]}"];'
-        )
-```
-
-(Or simply iterate `export_dict()` yourself — the structure is plain dicts.)
+conditions`. No private objects are exposed. `from_dict` restores full
+prediction capability — ideal for deploying rules to a production scoring
+service.
 
 ## API overview
 
 ```python
-SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=50, max_depth=None,
+SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=10, max_depth=None,
         quantiles=8, binary_features="auto", categorical_features=None,
         max_categories=12, handle_unknown="complement", feature_names=None,
         dtype=np.float64, feature_weights=None, max_leaf_nodes=None,
@@ -202,13 +189,18 @@ SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=50, max_depth=None,
 | Member | Purpose |
 |---|---|
 | `.fit(X)` / `.fit_predict(X)` / `.predict(X)` | sklearn-style fit & assignment |
+| `.score(X)` | heterogeneity reduction (plugs into `GridSearchCV`) |
+| `.transform(X)` | one-hot leaf encoding (Pipeline intermediate) |
+| `.apply(X)` | leaf indices (sklearn `apply` convention) |
 | `.labels_`, `.n_leaves_`, `.leaves_`, `.cuts_` | fitted structure |
 | `.reduction_`, `.h_avg_`, `.total_gain_`, `.summary()` | quality statistics |
+| `.feature_importances_` | normalized split gain per feature |
 | `.feature_weights_` | effective per-feature weights |
-| `.export_dict()` / `.export_text()` | public tree export (JSON-safe dict / text) |
+| `.export_dict()` / `.export_text()` / `.export_graphviz()` | public tree export |
+| `SegTree.from_dict(d)` | rebuild a predict-capable tree from `export_dict` |
 | `extract_rules(tree)` | list of `Rule` objects (`str(rule)` → readable chain) |
 | `replay_labels(tree, X)` / `replay_check(tree, X)` | rule-replay validation |
-| `profile_leaves(tree, X, top_k=3)` | z-score profiles per segment |
+| `profile_leaves(tree, X, top_k=3)` | `LeafProfile` per segment |
 | `bootstrap_stability(tree, X, n_replicates, random_state)` | mean/std of bootstrap ARI |
 | `adjusted_rand_score(a, b)` | pure-numpy ARI |
 
@@ -217,7 +209,7 @@ Tuning tips:
 - Fewer, larger segments → raise `min_gain` (e.g. `0.02–0.05`), lower
   `quantiles`, cap `max_depth` (e.g. 4–6), **or set `max_leaf_nodes`
   directly** when you know the target segment count.
-- Small datasets (< 5000 rows) → lower `min_leaf_abs` (it defaults to 50).
+- Small datasets (< 500 rows) → lower `min_leaf_abs` further (default is 10).
 - Business priority → emphasize key columns via `feature_weights` instead of
   dropping the rest.
 - Unstable segments (low bootstrap ARI) → fewer quantiles, higher `min_gain`,
@@ -239,8 +231,9 @@ Tuning tips:
 ```bash
 git clone <your-fork-url> && cd segmtree
 pip install -e .[dev]
-pytest            # run the test suite
-ruff check src tests
+pytest                       # run the test suite
+ruff check src tests         # lint
+ruff format --check src tests  # formatting
 ```
 
 ## License

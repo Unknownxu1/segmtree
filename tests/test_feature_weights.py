@@ -8,22 +8,7 @@ import pytest
 
 from segmtree import SegTree, replay_check
 from tests._naive_reference import NaiveSegTree
-
-
-def make_mixed_cat(n_per_group=200, seed=3):
-    """Three latent groups over 2 continuous + 1 binary + 1 categorical col."""
-    rng = np.random.default_rng(seed)
-    centers = [[0.0, 0.0], [6.0, 6.0], [-6.0, 6.0]]
-    parts = []
-    for k, center in enumerate(centers):
-        cont = rng.normal(center, 0.5, (n_per_group, 2))
-        flag = (rng.random((n_per_group, 1)) < 0.1 + 0.4 * k).astype(float)
-        code = np.full(n_per_group, k, dtype=float)
-        flip = rng.random(n_per_group) < 0.15
-        code[flip] = rng.integers(0, 3, int(flip.sum()))
-        parts.append(np.hstack([cont, flag, code[:, None]]))
-    return np.vstack(parts)
-
+from tests.conftest import make_mixed_cat
 
 PARAMS = dict(
     min_gain=0.02,
