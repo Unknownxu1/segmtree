@@ -12,6 +12,8 @@ from tests.conftest import make_mixed_cat
 
 PARAMS = dict(
     min_gain=0.02,
+    splitter="exact",
+    min_gain_mode="normalized",
     min_leaf_frac=0.05,
     min_leaf_abs=10,
     max_depth=3,
@@ -49,7 +51,14 @@ def test_weights_change_split_preference():
     f_strong = np.where(group == 0, 0.0, 6.0) + rng.normal(0, 0.5, n)
     f_weak = group * 0.8 + rng.normal(0, 0.5, n)
     X = np.column_stack([f_strong, f_weak])
-    base = dict(min_gain=0.01, min_leaf_frac=0.05, min_leaf_abs=30, quantiles=6)
+    base = dict(
+        min_gain=0.01,
+        min_leaf_frac=0.05,
+        min_leaf_abs=30,
+        quantiles=6,
+        splitter="exact",
+        min_gain_mode="normalized",
+    )
 
     default_first = SegTree(**base).fit(X).cuts_[0].feature_index
     reweighted_first = (
@@ -70,7 +79,12 @@ def test_zero_weight_feature_can_act_as_proxy_splitter():
     noisy_cont = np.where(group, 4.0, 0.0) + rng.normal(0, 1.0, n)  # overlapping
     X = np.column_stack([noisy_cont, proxy])
     tree = SegTree(
-        min_gain=0.01, min_leaf_frac=0.05, min_leaf_abs=30, feature_weights=[1.0, 0.0]
+        min_gain=0.01,
+        min_leaf_frac=0.05,
+        min_leaf_abs=30,
+        feature_weights=[1.0, 0.0],
+        splitter="exact",
+        min_gain_mode="normalized",
     ).fit(X)
     assert tree.cuts_, "a profitable proxy cut exists"
     # the zero-weight column yields the strictly cleaner partition
@@ -104,6 +118,8 @@ def test_weighted_tree_matches_naive_reference_exactly():
         quantiles=5,
         categorical_features=[3],
         feature_weights=[1.0, 2.0, 0.5, 1.0],
+        splitter="exact",
+        min_gain_mode="normalized",
     ).fit(X)
     ref = NaiveSegTree(
         min_gain=0.02,
@@ -190,6 +206,8 @@ def test_emphasis_steers_cut_to_emphasized_column():
         max_depth=1,
         quantiles=6,
         categorical_features=[2],
+        splitter="exact",
+        min_gain_mode="normalized",
     )
     for weights in (None, [1.0, 1.0, 6.0], [0.2, 8.0, 6.0]):
         tree = SegTree(**rich, feature_weights=weights).fit(X)

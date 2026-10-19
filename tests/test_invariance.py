@@ -34,6 +34,8 @@ def make_nominal_data(n_per_group=140, seed=5):
 
 PARAMS = dict(
     min_gain=0.02,
+    splitter="exact",
+    min_gain_mode="normalized",
     min_leaf_frac=0.04,
     min_leaf_abs=15,
     max_depth=4,

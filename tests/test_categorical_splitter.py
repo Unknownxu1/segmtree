@@ -28,6 +28,8 @@ def make_high_card_data(k=16, n=800, seed=4):
 
 OVR_PARAMS = dict(
     min_gain=0.02,
+    splitter="exact",
+    min_gain_mode="normalized",
     min_leaf_frac=0.05,
     min_leaf_abs=20,
     max_depth=3,
@@ -47,9 +49,12 @@ def test_exact_still_rejects_above_max_categories():
         SegTree(**OVR_PARAMS, categorical_splitter="exact", max_categories=12).fit(X)
     # error message must explain the exponential cost and name the alternative
     with pytest.raises(ValueError, match=r"2\^\(k-1\).*one_vs_rest"):
-        SegTree(min_leaf_abs=20, categorical_features=[2], categorical_splitter="exact").fit(
-            X[:, :]
-        )
+        SegTree(
+            min_leaf_abs=20,
+            categorical_features=[2],
+            categorical_splitter="exact",
+            min_gain_mode="normalized",
+        ).fit(X[:, :])
 
 
 def test_one_vs_rest_ignores_max_categories_and_fits():
@@ -73,7 +78,13 @@ def test_ovr_equals_exact_when_best_split_is_singleton():
     signal = np.where(codes == 0, 12.0, rng.normal(0, 0.5, n_per * 4))
     X = np.column_stack([cont, signal, codes])
     params = dict(
-        min_gain=0.05, min_leaf_frac=0.0, min_leaf_abs=60, quantiles=4, categorical_features=[2]
+        min_gain=0.05,
+        min_leaf_frac=0.0,
+        min_leaf_abs=60,
+        quantiles=4,
+        categorical_features=[2],
+        splitter="exact",
+        min_gain_mode="normalized",
     )
     exact = SegTree(**params, categorical_splitter="exact").fit(X)
     ovr = SegTree(**params, categorical_splitter="one_vs_rest").fit(X)
@@ -101,6 +112,8 @@ def test_ovr_matches_naive_reference():
         quantiles=5,
         categorical_features=[2],
         categorical_splitter="one_vs_rest",
+        splitter="exact",
+        min_gain_mode="normalized",
     ).fit(X)
     ref = NaiveSegTree(
         min_gain=0.02,
@@ -128,6 +141,8 @@ def test_ovr_float32_large_codes_stay_distinct():
             categorical_features=[1],
             dtype=dt,
             categorical_splitter="one_vs_rest",
+            splitter="exact",
+            min_gain_mode="normalized",
         ).fit(X)
         trees[dt] = tr
         assert sorted(tr.categories_["x1"]) == [int(big_a), int(big_b)]

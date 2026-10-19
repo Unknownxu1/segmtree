@@ -88,6 +88,7 @@ def bootstrap_stability(
     X: ArrayLike,
     *,
     n_replicates: int = 12,
+    subsample: float | int | None = None,
     random_state: int | np.random.Generator | None = None,
 ) -> StabilityResult:
     """Refit the tree on bootstrap resamples and measure agreement with the fit.
@@ -100,6 +101,12 @@ def bootstrap_stability(
         The training matrix used to fit ``tree``.
     n_replicates : int, default=12
         Number of bootstrap replicates (>= 1).
+    subsample : float, int or None, default=None
+        Size of each bootstrap replicate.  ``None`` uses the full training
+        size (the classic bootstrap).  A float in ``(0, 1]`` is a fraction of
+        ``n_samples``; an int is an absolute row count (``1..n_samples``).
+        Subsampling bounds the cost of stability assessment on large data:
+        each replicate is drawn with replacement from the requested size.
     random_state : int, numpy Generator or None, default=None
         Seed or generator for reproducibility.
 
@@ -126,12 +133,32 @@ def bootstrap_stability(
             f"X must be the training matrix with shape "
             f"{(tree.n_samples_in_, tree.n_features_in_)}, got {Xarr.shape}."
         )
+    n = int(Xarr.shape[0])
+    if subsample is None:
+        sample_size = n
+    elif isinstance(subsample, bool):
+        raise ValueError("subsample must be None, a float in (0, 1], or an int >= 1.")
+    elif isinstance(subsample, Integral):
+        sample_size = int(subsample)
+        if not 1 <= sample_size <= n:
+            raise ValueError(f"subsample must be in [1, {n}], got {sample_size}.")
+    elif isinstance(subsample, float):
+        if not 0.0 < subsample <= 1.0:
+            raise ValueError("subsample fraction must be in (0, 1].")
+        sample_size = max(1, round(subsample * n))
+    else:
+        raise ValueError("subsample must be None, a float in (0, 1], or an int >= 1.")
+
     params = tree.get_params()
+    # Replicas are fit on ndarrays, losing DataFrame column names.  Carry the
+    # resolved names so dict-keyed parameters (categorical_splitter,
+    # feature_weights) still resolve.
+    params["feature_names"] = list(tree.feature_names_)
     base_labels = tree.labels_
     rng = np.random.default_rng(random_state)
     scores = np.empty(n_replicates, dtype=np.float64)
     for b in range(n_replicates):
-        idx = rng.integers(0, Xarr.shape[0], Xarr.shape[0])
+        idx = rng.integers(0, n, sample_size)
         replica = SegTree(**params).fit(Xarr[idx])
         scores[b] = adjusted_rand_score(base_labels, replica.predict(Xarr))
     return StabilityResult(

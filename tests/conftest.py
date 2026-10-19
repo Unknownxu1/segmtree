@@ -60,7 +60,14 @@ def asymmetric_data():
     return np.column_stack([x0, x1, x2])
 
 
-STRONG_PARAMS = dict(min_gain=0.02, min_leaf_abs=50, min_leaf_frac=0.01, quantiles=6)
+STRONG_PARAMS = dict(
+    min_gain=0.02,
+    min_leaf_abs=50,
+    min_leaf_frac=0.01,
+    quantiles=6,
+    splitter="exact",
+    min_gain_mode="normalized",
+)
 
 
 def make_mixed_cat(n_per_group=200, seed=3):

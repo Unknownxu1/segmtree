@@ -64,7 +64,14 @@ def test_root_cut_is_global_best_by_brute_force():
     X[150:, 1] += 3.0
     X[:, 3] = (rng.random(300) < (np.arange(300) < 150)).astype(float)
     qgrid = np.linspace(0.05, 0.95, 8)
-    tree = SegTree(min_gain=0.0, min_leaf_frac=0.0, min_leaf_abs=30, quantiles=qgrid).fit(X)
+    tree = SegTree(
+        min_gain=0.0,
+        min_leaf_frac=0.0,
+        min_leaf_abs=30,
+        quantiles=qgrid,
+        splitter="exact",
+        min_gain_mode="normalized",
+    ).fit(X)
 
     rv = np.var(X, axis=0)
 
@@ -153,7 +160,15 @@ def test_exact_ties_break_identically_in_production_and_reference():
     rng = np.random.default_rng(4)
     signal = np.r_[rng.normal(0, 0.4, 200), rng.normal(6, 0.4, 200)]
     X = np.column_stack([signal, signal.copy(), rng.normal(size=400)])
-    mine = SegTree(min_gain=0.05, min_leaf_frac=0.0, min_leaf_abs=40, max_depth=2, quantiles=4)
+    mine = SegTree(
+        min_gain=0.05,
+        min_leaf_frac=0.0,
+        min_leaf_abs=40,
+        max_depth=2,
+        quantiles=4,
+        splitter="exact",
+        min_gain_mode="normalized",
+    )
     mine = mine.fit(X)
     ref_q = np.linspace(0.05, 0.95, 4)
     ref = NaiveSegTree(min_gain=0.05, min_leaf=40, max_depth=2, quantiles=ref_q).fit(X)
@@ -165,9 +180,15 @@ def test_full_tree_partition_matches_reference_after_fix():
     """End-to-end: with corrected ordering, production and independent
     reference produce the identical partition and cut count."""
     X = asymmetric_data()
-    mine = SegTree(min_gain=0.02, min_leaf_frac=0.0, min_leaf_abs=50, max_depth=3, quantiles=6).fit(
-        X
-    )
+    mine = SegTree(
+        min_gain=0.02,
+        min_leaf_frac=0.0,
+        min_leaf_abs=50,
+        max_depth=3,
+        quantiles=6,
+        splitter="exact",
+        min_gain_mode="normalized",
+    ).fit(X)
     ref = NaiveSegTree(
         min_gain=0.02, min_leaf=50, max_depth=3, quantiles=np.linspace(0.05, 0.95, 6)
     ).fit(X)

@@ -29,7 +29,9 @@ __all__ = [
 
 
 def _fmt_codes(categories: Sequence[int]) -> str:
-    return "{" + ", ".join(format_threshold(float(c)) for c in sorted(categories)) + "}"
+    # Render integer codes exactly; a float round-trip would turn large int64
+    # codes (above 2**53) into scientific notation and merge distinct values.
+    return "{" + ", ".join(str(int(c)) for c in sorted(categories)) + "}"
 
 
 @dataclass(frozen=True)
@@ -132,7 +134,11 @@ def rule_mask(rule: Rule, X: ArrayLike, feature_names: Sequence[str]) -> NDArray
     Evaluated independently of the tree. ``feature_names`` maps column
     positions to the names used in the rule's conditions.
     """
-    Xarr = np.asarray(X, dtype=np.float64)
+    # Keep integer dtypes: casting int64 category codes through float64
+    # would merge adjacent values above 2**53.
+    Xarr = np.asarray(X)
+    if Xarr.dtype.kind not in "biuf":
+        Xarr = Xarr.astype(np.float64)
     if Xarr.ndim != 2:
         raise ValueError(f"X must be 2-D, got shape {Xarr.shape}.")
     mask = np.ones(Xarr.shape[0], dtype=bool)
@@ -174,10 +180,21 @@ def replay_labels(tree: SegTree, X: ArrayLike) -> NDArray[np.intp]:
     ):
         cat_codes = tree._encode_input_categories(Xarr)
         tree._check_unknown(Xarr, cat_codes)
-    out = np.full(Xarr.shape[0], -1, dtype=np.intp)
-    covered = np.zeros(Xarr.shape[0], dtype=bool)
+    # Match ``predict``: numeric thresholds are evaluated on values cast to
+    # the training dtype.  Thresholds are stored as representable values of
+    # that dtype, so replaying on the raw (e.g. float64) matrix could route
+    # boundary rows differently.  Categorical columns keep their exact codes.
+    cat_idx = set(int(j) for j in getattr(tree, "categorical_indices_", np.array([])))
+    num_cols = [j for j in range(Xarr.shape[1]) if j not in cat_idx]
+    if num_cols:
+        Xreplay = np.array(Xarr, copy=True)
+        Xreplay[:, num_cols] = Xarr[:, num_cols].astype(np.dtype(tree.dtype))
+    else:
+        Xreplay = Xarr
+    out = np.full(Xreplay.shape[0], -1, dtype=np.intp)
+    covered = np.zeros(Xreplay.shape[0], dtype=bool)
     for rule in extract_rules(tree):
-        m = rule_mask(rule, Xarr, tree.feature_names_)
+        m = rule_mask(rule, Xreplay, tree.feature_names_)
         out[m & ~covered] = rule.leaf_id
         covered |= m
     return out

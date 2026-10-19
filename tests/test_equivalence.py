@@ -29,7 +29,12 @@ def make_dataset(seed):
     return np.hstack([np.vstack(parts), noise]), np.concatenate(labels)
 
 
-PARAMS = dict(min_gain=0.03, min_leaf=30, max_depth=4, quantiles=np.linspace(0.05, 0.95, 6))
+PARAMS = dict(
+    min_gain=0.03,
+    min_leaf=30,
+    max_depth=4,
+    quantiles=np.linspace(0.05, 0.95, 6),
+)
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3])
@@ -41,6 +46,8 @@ def test_exact_agreement_with_reference(seed):
         min_leaf_abs=PARAMS["min_leaf"],
         max_depth=PARAMS["max_depth"],
         quantiles=PARAMS["quantiles"],
+        splitter="exact",
+        min_gain_mode="normalized",
     ).fit(X)
     ref = NaiveSegTree(**PARAMS).fit(X)
 
@@ -64,7 +71,14 @@ def test_partition_quality_agreement_randomized(seed):
     X, _ = make_dataset(seed)
     X += np.random.default_rng(seed + 100).normal(0, 0.05, X.shape)
     n = X.shape[0]
-    mine = SegTree(min_gain=0.02, min_leaf_frac=0.05, min_leaf_abs=20, quantiles=5).fit(X)
+    mine = SegTree(
+        min_gain=0.02,
+        min_leaf_frac=0.05,
+        min_leaf_abs=20,
+        quantiles=5,
+        splitter="exact",
+        min_gain_mode="normalized",
+    ).fit(X)
     ref_min_leaf = max(20, int(0.05 * n))
     ref = NaiveSegTree(
         min_gain=0.02, min_leaf=ref_min_leaf, max_depth=None, quantiles=np.linspace(0.05, 0.95, 5)
@@ -78,6 +92,12 @@ def test_binary_only_data_matches_reference():
     a = rng.random(n) < 0.7
     b = np.where(a, rng.random(n) < 0.9, rng.random(n) < 0.2)
     X = np.column_stack([a.astype(float), b.astype(float), (rng.random(n) < 0.4).astype(float)])
-    mine = SegTree(min_gain=0.01, min_leaf_frac=0.05, min_leaf_abs=20).fit(X)
+    mine = SegTree(
+        min_gain=0.01,
+        min_leaf_frac=0.05,
+        min_leaf_abs=20,
+        splitter="exact",
+        min_gain_mode="normalized",
+    ).fit(X)
     ref = NaiveSegTree(min_gain=0.01, min_leaf=max(20, int(0.05 * n))).fit(X, binary_set={0, 1, 2})
     assert np.array_equal(mine.labels_, ref.labels_)

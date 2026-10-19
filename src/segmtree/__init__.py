@@ -21,7 +21,7 @@ from .rules import (
 from .stability import StabilityResult, adjusted_rand_score, bootstrap_stability
 from .tree import Cut, Leaf, SegTree
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "Condition",

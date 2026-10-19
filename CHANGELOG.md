@@ -1,5 +1,180 @@
 # Changelog
 
+## 0.6.0 — 2026-10-19
+
+Scalability and robustness release driven by 16 production issues reproduced
+on an 829k x 300 customer table.
+
+### New: scalable split search (`splitter="hist"`, the default for all data)
+
+- **The default split-search path is now the histogram path for every data
+  size.**  The original exact algorithm remains available only as an explicit
+  `splitter="exact"` legacy/reference mode; it is not used automatically and
+  is not recommended for production (its per-node cost is
+  `O(n_features² · n_node)` with several full-size buffers).
+- The histogram path (`splitter="hist"`, `max_bins=32`) bins each continuous
+  feature into quantile bins once, then per node:
+  1. ranks candidates with an association-gated proxy
+     (`delta_variance * mean squared association`, where association is
+     Pearson r² / correlation ratio η² / Cramér's V² estimated on a
+     deterministic random sample of at most 50k rows, adaptively capped to
+     ~4M cells on very wide data);
+  2. re-scores the top 4 candidates with the actual **node-local
+     cross-feature** heterogeneity drop, subtracting the expected `1/n_eff`
+     random-split noise floor.
+  This removes the median-cut self-variance bias (any continuous column loses
+  ~64% of its variance under a median cut, even for pure noise), and prevents
+  within-cluster over-splitting.  Multi-column pure-noise data stops at a
+  single leaf when there are enough rows; a single-column problem has no
+  cross-feature corroboration and follows the exact-path self-variance
+  criterion.
+- Histogram is not just a large-data fallback: on 1,200×6 it runs in ~0.011 s
+  with 5 leaves versus ~0.089 s / 69 leaves for exact; on 20,000×50 it is
+  ~0.39 s / 7 leaves versus ~8.2 s / 65 leaves.  Exact's variance criterion
+  over-splits noise on wide data, so the default is now histogram for every
+  size.
+- The histogram path never allocates the old `(n_numeric x n_samples)`
+  float64 buffers, never keeps per-feature `argsort` orders, and releases its
+  bin codes after fit.  Working memory is `n x F` values (`dtype`) plus one
+  byte per bin code for `max_bins <= 256` (two bytes above), plus an
+  `O(F²)` association matrix during fit (0.7 MB at 300 columns).  `predict`
+  no longer casts the whole matrix either.
+- Measured end-to-end (peak RSS sampled during fit and includes the caller's
+  input matrix; float32 for the largest case):
+  | shape | path | time | peak RSS | leaves |
+  |---|---|---|---|---|
+  | 200k x 30 | hist | 2.5 s | 263 MB | 4 |
+  | 60k x 300 (3 informative) | hist | 5.5 s | 489 MB | 4 |
+  | 300k x 301 (3 informative) | hist | 29 s | 1,015 MB | 4 |
+  | 829k x 301 (3 informative, f32) | hist | 84 s | 2,439 MB (input 1,152 MB) | 4 |
+  | 60k x 300 pure noise | hist | 3.3 s | 497 MB | 1 |
+  | exact reference on 1000 x 202 | exact | — | — | root (issue #6 repro) |
+- The exact path itself is now **chunked over numeric features**
+  (`_EXACT_BUFFER_BYTES`, 192 MiB cap) instead of allocating four full
+  `(n_num x n)` float64 buffers.  Partitions and thresholds are identical to
+  the single-buffer implementation; gains may differ at floating-point
+  round-off (regression-tested by forcing a 2-row chunk and by a randomized
+  chunked-vs-unchunked fuzz).
+- Categorical prefix counts on the exact path are computed only at candidate
+  positions, avoiding `(n_node x k)` one-hot prefix allocations.
+
+### Fixed: `min_gain` no longer drifts with the number of columns (#6)
+
+- New `min_gain_mode={"auto", "sqrt", "total", "normalized"}`.
+  `"auto"` (default) resolves to `"sqrt"` on the default histogram path and
+  to `"normalized"` only for the explicit `splitter="exact"` mode, preserving
+  its original threshold semantics.
+  `"total"`/`"sqrt"` decouple the threshold from `n_features`, so adding weak
+  columns no longer silently stops the tree at the root.
+- Regression test reproduces the report exactly: two perfectly separating
+  columns + 200 noise columns with legacy `min_gain=0.01` → 1 leaf; the same
+  data on the default histogram path finds the signal and ignores all noise.
+
+### Fixed: categorical handling (#8, #9, #10, #16)
+
+- **`categorical_splitter` default is now `"auto"`**: columns with more than
+  `max_categories` codes automatically fall back to `"one_vs_rest"` with a
+  warning instead of failing the whole fit.  Explicit `"exact"` still raises.
+- `categorical_splitter` accepts a **dict** mapping feature names or indices
+  to strategies, so e.g. a 6-level column can use exact enumeration while a
+  14-level column uses one-vs-rest in the same fit.
+- Exact categorical candidate matrices are **pre-checked at fit start**
+  (cardinality and estimated MiB across all numeric features), before any
+  tree is built.  Errors now name the column, cardinality, candidate count,
+  estimated memory, current `n_numeric`, and the suggested parameters.
+- Node-level exact enumeration still refuses > 1M candidates with context.
+- **Int64 category codes above `2**53` are preserved exactly**: integer-typed
+  columns are cast directly to int64, and categorical block detection /
+  prediction use the int64 code arrays instead of a float64 copy.  Adjacent
+  codes such as `2**60` and `2**60 + 1` no longer collapse.
+- The unused `(n_cat x n)` float64 code copy (`_XcT_cat_`) and the dead
+  `_require_fitted()` wrapper were removed.
+
+### New: observability and reproducibility (#12, #15)
+
+- `random_state` seeds association subsampling and random tie-breaking
+  (equal gains / equal candidate thresholds).  `None` keeps deterministic
+  first-seen tie-breaks, so default fits stay reproducible.
+- `verbose=1` prints one line per executed split (depth, node size, feature,
+  gain, child sizes, elapsed) and a final summary.
+- `bootstrap_stability(..., subsample=None|float|int)`: draw each replicate
+  with replacement from a bounded size (fraction or absolute row count)
+  instead of always retraining on the full sample (#7).
+- `h_root_` now reports the **actual** root heterogeneity (1.0 when no
+  column is constant, lower with constant columns, 0 for all-constant input);
+  `h_root_normalized_` is the 1.0 normalization baseline.  Raw root
+  statistics are exposed as `root_variances_` and `root_ginis_` (#11).
+- New fitted attributes: `splitter_`, `max_bins_`, `association_`.
+
+### Fixed: findings from the adversarial audit
+
+- **`one_vs_rest` categorical scoring on the histogram path**: every
+  candidate used to receive the same Gini value (the category proportions
+  were summed over the candidate axis instead of evaluated per candidate),
+  so the tree always picked the lowest code.  Right-side impurity is now
+  computed analytically per candidate.
+- **float32 threshold consistency**: exact thresholds are committed as the
+  largest left-side *observed* value (representable in `dtype`), while
+  histogram edges/bins are quantized to `dtype` before use.  Rows adjacent at
+  float32 spacing (e.g. `1e6` vs `1e6 + 0.0625`) no longer route differently
+  between `labels_` and `predict`; `replay_labels` casts numeric columns to
+  the training dtype like `predict` does.
+- **Association estimation** now centers columns in float64 before the
+  float32 cast, so large-offset columns (amounts, timestamps, IDs) keep
+  meaningful r²/η²; the categorical χ² includes the contribution of
+  unobserved contingency cells (correct Cramér's V).
+- **Periodic columns**: bin edges use a random (endpoint-inclusive) sample
+  instead of a fixed stride, which could alias with alternating data.
+- **Binary columns on the histogram path** now get their single midpoint
+  (0.5 for `{0, 1}`) candidate even when the quantile grid collapses onto
+  the maximum value.
+- **High-cardinality `one_vs_rest` no longer builds `(k_blocks x k_cat)`
+  dense tables** on the exact path.  The split column uses analytic Gini;
+  other columns use sparse observed-cell contingency arithmetic above a
+  4M-cell threshold.  A 12,000-category fit went from ~4.4 GB peak / 2.75 s
+  to ~0 MB / 0.01 s.
+- `score()`, `rule_mask`, replay and rule text now preserve int64 category
+  codes above `2**53` (score no longer returns 1.0 for a single-leaf tree,
+  replay matches `predict`, and rule text shows exact integers).
+- `bootstrap_stability` carries resolved feature names into replicas, so
+  name-keyed `categorical_splitter` / `feature_weights` dicts work with
+  DataFrame input.
+- The categorical memory pre-check budgets only the selected path with
+  realistic temporary-matrix factors instead of summing both paths.
+- **Performance cleanups found by the audit**: `binary_features="auto"` uses
+  vectorized min/max plus a linear `{0,1}` check (0.17 s at 829k x 300,
+  previously ~25 s of `np.unique` per column); `as_2d_array` validates
+  finiteness in chunks (2 MB instead of an `n x F` mask); `predict` encodes
+  only categorical columns used by a cut (unless `handle_unknown="error"`);
+  fit frees `_cat_codes_`, `_cat_meta_` and `_sw_`; association reuses
+  per-column totals.
+
+### Documentation
+
+- Parameter docs state the histogram memory formula and the exact path's
+  `O(n_features² · n_node)` cost.  README (both languages) gained a
+  large-data section with the hist-default / exact-opt-in guidance and measured
+  numbers.
+
+### Testing
+
+- 33 new tests in `tests/test_scalability.py` (179 total): default-hist and
+  explicit-exact selection,
+  histogram cluster recovery, pure-noise root stop, issue #6 reproduction,
+  fit-state release, per-column categorical strategies, auto degradation,
+  pre-fit categorical memory check, chunked-exact identity (deterministic and
+  randomized differential fuzz), reproducibility, verbose output, stability
+  subsampling sizes, root statistics, weighted/categorical histogram paths,
+  `max_bins` code dtype and edge resolution, sample-weight behavior,
+  per-candidate one-vs-rest scoring, per-column strategy behavior,
+  float32 boundary thresholds, large-offset association, periodic-column
+  sampling, imbalanced binary columns, unobserved-cell Cramér's V,
+  all-constant input, high-cardinality categorical memory (tracemalloc
+  < 100 MiB where the old dense table alone was ~275 MiB), sparse-vs-dense
+  contingency equivalence, exact int64 score/rule text, predict encoding only
+  used categorical columns, and DataFrame bootstrap.
+- `ruff check` and `ruff format --check` clean.
+
 ## 0.5.0 — 2026-09-23
 
 ### Fixed

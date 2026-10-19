@@ -30,7 +30,11 @@ def make_cat_data(n=600, k=4, seed=8):
 def test_categorical_subset_rules_and_replay():
     X, _ = make_cat_data()
     tree = SegTree(
-        min_gain=0.01, min_leaf_frac=0.03, min_leaf_abs=20, categorical_features=[2]
+        min_gain=0.01,
+        min_leaf_frac=0.03,
+        min_leaf_abs=20,
+        categorical_features=[2],
+        splitter="exact",
     ).fit(X)
     assert set(tree.categorical_indices_) == {2}
     cat_cuts = [c for c in tree.cuts_ if c.feature_index == 2]
@@ -54,6 +58,8 @@ def test_exact_agreement_with_naive_reference():
         max_depth=4,
         quantiles=5,
         categorical_features=[2],
+        splitter="exact",
+        min_gain_mode="normalized",
     ).fit(X)
     ref = NaiveSegTree(
         min_gain=0.02, min_leaf=25, max_depth=4, quantiles=np.linspace(0.05, 0.95, 5)
@@ -81,7 +87,13 @@ def test_mixed_cont_bin_cat_matches_naive():
     ).astype(float)
     X = np.hstack([cont, binary, cat[:, None]])
     mine = SegTree(
-        min_gain=0.02, min_leaf_frac=0.05, min_leaf_abs=20, quantiles=6, categorical_features=[3]
+        min_gain=0.02,
+        min_leaf_frac=0.05,
+        min_leaf_abs=20,
+        quantiles=6,
+        categorical_features=[3],
+        splitter="exact",
+        min_gain_mode="normalized",
     ).fit(X)
     ref = NaiveSegTree(
         min_gain=0.02, min_leaf=max(20, int(0.05 * n)), quantiles=np.linspace(0.05, 0.95, 6)
@@ -110,11 +122,16 @@ def test_conflict_with_binary_features_raises():
         )
 
 
-def test_max_categories_exceeded_raises():
+def test_max_categories_auto_degrades_and_exact_raises():
     rng = np.random.default_rng(5)
     X = np.column_stack([rng.normal(size=(200, 1)), rng.integers(0, 20, 200).astype(float)])
+    # Default "auto" degrades high-cardinality columns instead of failing.
+    with pytest.warns(UserWarning, match="one_vs_rest"):
+        tree = SegTree(categorical_features=[1], max_categories=12, min_leaf_abs=10).fit(X)
+    assert tree.n_leaves_ >= 1
+    # Explicit "exact" keeps the hard failure, but only after an early check.
     with pytest.raises(ValueError, match="max_categories"):
-        SegTree(categorical_features=[1], max_categories=12).fit(X)
+        SegTree(categorical_features=[1], max_categories=12, categorical_splitter="exact").fit(X)
     tree = SegTree(categorical_features=[1], max_categories=20, min_leaf_abs=10).fit(X)
     assert tree.n_leaves_ >= 1
 
@@ -140,7 +157,10 @@ def test_integer_counts_stay_continuous_by_default():
 def test_explicit_names_resolution():
     X, _ = make_cat_data(n=240)
     tree = SegTree(
-        min_leaf_abs=10, feature_names=["v0", "v1", "grade"], categorical_features=["grade"]
+        min_leaf_abs=10,
+        feature_names=["v0", "v1", "grade"],
+        categorical_features=["grade"],
+        splitter="exact",
     ).fit(X)
     assert list(tree.categorical_indices_) == [2]
     assert any("grade" in str(c) for r in extract_rules(tree) for c in r.conditions)
@@ -161,7 +181,13 @@ def test_float32_large_integer_codes_stay_distinct():
 
     trees = {}
     for dt in (np.float64, np.float32):
-        tr = SegTree(min_leaf_abs=20, categorical_features=[1], dtype=dt).fit(X)
+        tr = SegTree(
+            min_leaf_abs=20,
+            categorical_features=[1],
+            dtype=dt,
+            splitter="exact",
+            min_gain_mode="normalized",
+        ).fit(X)
         trees[dt] = tr
         assert sorted(tr.categories_["x1"]) == [int(big_a), int(big_b)], "codes merged!"
         cat_cuts = [c for c in tr.cuts_ if c.feature_index == 1]
@@ -170,6 +196,29 @@ def test_float32_large_integer_codes_stay_distinct():
     from segmtree import adjusted_rand_score
 
     assert adjusted_rand_score(trees[np.float64].labels_, trees[np.float32].labels_) == 1.0
+
+
+def test_int64_codes_above_float64_exact_range_stay_distinct():
+    """Adjacent codes above 2**53 must not collapse through a float64 cast."""
+    big_a, big_b = 2**60, 2**60 + 1
+    X = np.array([big_a, big_b] * 30, dtype=np.int64).reshape(-1, 1)
+    tree = SegTree(categorical_features=[0], min_leaf_abs=10).fit(X)
+    assert tree.categories_["x0"].tolist() == [big_a, big_b]
+    assert tree.n_leaves_ == 2
+    assert np.array_equal(tree.predict(X), tree.labels_)
+    assert replay_check(tree, X)
+    # Rule text must render the exact codes, not 1.15292e+18.
+    text = "\n".join(str(rule) for rule in extract_rules(tree))
+    assert str(big_b) in text
+    # score() must also keep the codes distinct (was returning 1.0 for a
+    # single-leaf tree because the codes collapsed in float64).
+    flat = SegTree(categorical_features=[0], min_gain=1.01, min_leaf_abs=10).fit(X)
+    assert flat.n_leaves_ == 1
+    assert flat.score(X) == 0.0
+    with pytest.raises(ValueError, match="Unknown category"):
+        SegTree(categorical_features=[0], handle_unknown="error", min_leaf_abs=10).fit(X).predict(
+            np.array([[big_b + 1]], dtype=np.int64)
+        )
 
 
 def test_categories_attribute():

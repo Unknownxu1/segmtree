@@ -146,10 +146,18 @@ def as_2d_array(X: ArrayLike, *, context: str = "X") -> tuple[NDArray[np.floatin
         raise ValueError(f"{context} must be 2-D (n_samples, n_features), got shape {arr.shape}.")
     if arr.shape[0] == 0 or arr.shape[1] == 0:
         raise ValueError(f"{context} must not be empty, got shape {arr.shape}.")
-    if not np.isfinite(arr).all():
-        n_bad = int((~np.isfinite(arr)).sum())
-        raise ValueError(
-            f"{context} contains {n_bad} NaN/infinite value(s). "
-            "Impute or drop them before fitting (segmtree does no imputation)."
-        )
+    if np.issubdtype(arr.dtype, np.floating):
+        # Chunked so a valid n x F matrix never allocates a full boolean
+        # mask (n x F bytes) just for validation.
+        n_bad = 0
+        chunk_rows = max(1, 1_000_000 // max(1, arr.shape[1]))
+        for start in range(0, arr.shape[0], chunk_rows):
+            finite = np.isfinite(arr[start : start + chunk_rows])
+            if not finite.all():
+                n_bad += int((~finite).sum())
+        if n_bad:
+            raise ValueError(
+                f"{context} contains {n_bad} NaN/infinite value(s). "
+                "Impute or drop them before fitting (segmtree does no imputation)."
+            )
     return arr, columns
