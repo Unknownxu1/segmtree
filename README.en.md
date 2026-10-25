@@ -158,8 +158,8 @@ it is never selected automatically and is not recommended for production.
 
 | Implementation | When | Per-node cost | Memory |
 |---|---|---|---|
-| `"hist"` (default) | all data sizes | `O(F · n_node)` | `n×F` values + 1 byte per bin code (2 bytes above 256 bins) + an `O(F²)` association matrix during fit |
-| `"exact"` | explicit only: validation against the original algorithm | `O(F² · n_node)` | chunked buffers (≤192 MiB) |
+| `"hist"` (default) | all data sizes | `O(F · n_node)` | input `n×F` + 1 byte per bin code (2 bytes above 256 bins) + optional centered copy (≤1 GiB, disabled by `low_memory=True`) + a ≤32 MiB blockwise association workspace |
+| `"exact"` | explicit only: validation against the original algorithm | `O(F² · n_node)` | chunked buffers (≤192 MiB) + centered copy |
 
 The exact mode exists mainly for bit-level comparison against the independent
 naive reference implementation and for cases that need its original criterion
@@ -169,7 +169,9 @@ The histogram path first ranks all candidates with an **association proxy**
 (Pearson r² for numeric pairs, correlation ratio η² for categorical-numeric,
 Cramér's V² for categorical pairs, estimated on at most 50k rows), then
 re-scores the top four with the **node-local heterogeneity drop of the other
-columns**, subtracting the `1/n_eff` random-split noise floor. As a result:
+columns**, subtracting the `1/n_eff` random-split noise floor. Pairwise
+association keeps only its per-feature row sums; numeric pairs are accumulated
+in feature blocks, so the full `F×F` matrix is never materialized. As a result:
 
 - pure-noise data stops at a single leaf when at least two columns and
   enough rows provide corroboration (a median cut of any continuous column
@@ -184,26 +186,41 @@ path, decoupling `min_gain` from the number of columns; only the explicit
 `splitter="exact"` mode keeps the original (feature-averaged) threshold. Set
 `"total"` or `"normalized"` explicitly if you need a different unit.
 
-Measured end-to-end (single machine; peak RSS sampled during fit and
-**includes the caller's input matrix**; `dtype=np.float32` for the largest
-case):
+Same-machine before/after (identical synthetic data: 3 signal columns plus
+noise; Windows / Python 3.12 / numpy 2.4; `0.6.0` is the pre-optimization
+version; float64 except where marked f32):
 
-| Data | Path | Time | Peak RSS | Leaves |
+| Data | 0.6.0 | Optimized | Speedup | Leaves |
 |---|---|---|---|---|
-| 200k × 30 | hist | 2.5 s | 263 MB | 4 |
-| 60k × 300 (3 signal columns) | hist | 5.5 s | 489 MB | 4 |
-| 300k × 301 (3 signal columns) | hist | 29 s | 1,015 MB | 4 |
-| **829k × 301 (3 signal columns, f32)** | hist | **84 s** | **2,439 MB (input 1,152 MB)** | 4 |
-| 60k × 300 (pure noise) | hist | 3.3 s | 497 MB | 1 |
+| 20k × 50 | 0.31 s | **0.11 s** | 2.8× | 6 |
+| 60k × 300 | 3.0 s | **1.2 s** | 2.6× | 4 |
+| 150k × 300 | 8.0 s | **3.1 s** | 2.6× | 4 |
+| 300k × 300 (f64) | 16.5 s | **6.8 s** | 2.4× | 4 |
+| **829k × 301 (f32)** | 51.8 s | **21.8 s** | **2.4×** | 4 |
+| 500k × 30 | 3.4 s | **1.4 s** | 2.4× | 8 |
+| 5,000 × 2,000 (wide) | 1.4 s | **0.9 s** | 1.6× | 2 |
+| 2,000 × 10,000 (ultra-wide) | 5.3 s | **3.8 s** | 1.4× | 2 |
 
-The second-to-last row is the originally reported scale: the old
-implementation OOM'd there; the histogram path finishes in ~1.4 minutes, uses
-~1.3 GB beyond the input, and splits only on 2 of the 3 signal columns.
+The gains come from computing quantile edges with one sort instead of the
+multi-quantile `partition` path, batching the top-four cross-feature gain
+verification into BLAS products, and accumulating association row sums in
+feature blocks instead of materializing an `F×F` matrix.
 
-Small and medium data benefit too: on 1,200×6 the histogram path takes
-~0.011 s / 5 leaves versus ~0.089 s / 69 leaves for exact; on 20,000×50 it is
-~0.39 s / 7 leaves versus ~8.2 s / 65 leaves (exact tends to cut noise into
-many leaves on wide data). This is why histogram is the default everywhere.
+Memory:
+
+- A centered numeric copy is cached when it fits a 1 GiB budget (faster
+  repeated node scans); the copy itself never exceeds what 0.6.0 always
+  retained, and the batched/blocked temporaries add only tens of MiB. Larger
+  matrices center columns on demand.
+- `low_memory=True` disables that cache: 829k × 301 (f32) drops from ~1.3 GB
+  of extra fit memory to ~0.38 GB (total peak ~1.35 GB including input), at
+  ~36 s instead of ~22 s.
+- On 2,000 × 10,000, peak fit memory (tracemalloc) drops from 2.54 GB to
+  **318 MB** because the association matrix is no longer materialized.
+
+Small and medium data benefit as well: histogram takes ~0.008 s on 1,200×6
+and ~0.11 s on 20,000×50; exact tends to cut noise into many leaves on wide
+data. This is why histogram is the default everywhere.
 
 Other related parameters:
 
@@ -212,6 +229,8 @@ Other related parameters:
   (`None` keeps deterministic first-seen ties);
 - `verbose=1`: one line per split (depth, size, feature, gain, children,
   elapsed) plus a final summary;
+- `low_memory=True`: skip the histogram path's centered-matrix cache, trading
+  roughly 20–70% extra time for about one `n×F` array of memory;
 - `bootstrap_stability(..., subsample=0.5)`: train each replicate on a bounded
   sample instead of the full data.
 
@@ -261,7 +280,7 @@ SegTree(min_gain=0.01, min_leaf_frac=0.01, min_leaf_abs=10, max_depth=None,
         max_categories=12, handle_unknown="complement", feature_names=None,
         dtype=np.float64, feature_weights=None, max_leaf_nodes=None,
         categorical_splitter="auto", splitter="hist", max_bins=32,
-        min_gain_mode="auto", random_state=None, verbose=0)
+        min_gain_mode="auto", random_state=None, verbose=0, low_memory=False)
 ```
 
 | Member | Purpose |

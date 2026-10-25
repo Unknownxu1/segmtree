@@ -41,6 +41,15 @@ _EXACT_BUFFER_BYTES = 192 * 1024**2  # numeric prefix-sum buffers per chunk
 _EXACT_CAT_MATRIX_BYTES = 512 * 1024**2  # exact categorical candidate matrix
 _ASSOC_SAMPLE_ROWS = 50_000  # rows used to estimate pairwise association
 _DENSE_CAT_CELLS = 4_000_000  # above this, categorical cont tables go sparse
+# Histogram path only: below this size keep a centered copy of the numeric
+# matrix (fastest).  Above it, center each gathered column on demand instead,
+# trading a small amount of CPU for roughly half the additional memory.  The
+# cap means fits never use more transient memory than before this cache became
+# optional, while truly huge matrices still avoid the extra full-size copy.
+_CENTERED_COPY_BYTES = 1024 * 1024**2
+# Numeric-numeric association is accumulated over feature blocks; only the
+# per-feature row sums are retained, never the full F x F matrix.
+_ASSOC_BLOCK_BYTES = 32 * 1024**2
 
 
 @dataclass(frozen=True, eq=False)
@@ -293,8 +302,10 @@ class SegTree(BaseEstimator):
         divides it by ``n_features - 1``); per-node cost is
         ``O(n_node · n_features)``, the full-data buffers are ``n x F`` values
         plus one byte per bin code (two bytes above 256 bins), and no
-        per-feature sort orders are kept.  A pairwise ``O(F²)`` association
-        matrix exists during fit.  Its search first ranks candidates by an
+        per-feature sort orders are kept.  A centered numeric copy is cached
+        when it fits a 1 GiB budget (unless ``low_memory=True``).  Pairwise
+        association is accumulated blockwise, so only its per-feature row sums
+        are retained.  Its search first ranks candidates by an
         association-gated proxy, then scores the top few with the actual
         node-local heterogeneity drop of the *other* features — this avoids
         the median-cut self-variance bias and keeps multi-column pure-noise
@@ -323,6 +334,13 @@ class SegTree(BaseEstimator):
         ``0`` is silent.  ``>= 1`` prints one line per executed split
         (depth, node size, gain, children, elapsed time) to stdout, which
         makes long fits on large data observable.
+    low_memory : bool, default=False
+        Histogram path only.  By default a centered copy of the numeric
+        matrix is cached when it fits a 1 GiB budget (faster repeated node
+        scans); larger matrices are already centered on demand.  Set
+        ``low_memory=True`` to always use the on-demand path, lowering peak
+        memory by roughly one ``n_samples x n_numeric`` array at the cost of
+        slower fits.  Ignored by the explicit ``splitter="exact"`` mode.
 
     Attributes
     ----------
@@ -360,8 +378,9 @@ class SegTree(BaseEstimator):
     association_ : ndarray of float64, shape (n_features_in_,)
         Sum of squared associations of each column with the other columns
         (Pearson r² / correlation ratio η² / Cramér's V²), estimated on at
-        most 50k rows.  Empty on the exact path.  The pairwise matrix is
-        O(n_features²) during fit (0.7 MB at 300 columns).
+        most 50k rows.  Empty on the exact path.  Numeric-numeric pairs are
+        accumulated in feature blocks (≤32 MiB), so the full ``F x F`` matrix
+        is never materialized.
     feature_importances_ : ndarray of float64, shape (n_features_in_,)
         Normalized sum of split gains per feature (sklearn convention).
     feature_names_ : list of str
@@ -424,6 +443,7 @@ class SegTree(BaseEstimator):
         min_gain_mode: str = "auto",
         random_state: int | np.random.Generator | None = None,
         verbose: int = 0,
+        low_memory: bool = False,
     ):
         self.min_gain = min_gain
         self.min_leaf_frac = min_leaf_frac
@@ -444,6 +464,7 @@ class SegTree(BaseEstimator):
         self.min_gain_mode = min_gain_mode
         self.random_state = random_state
         self.verbose = verbose
+        self.low_memory = low_memory
 
     # ------------------------------------------------------------------ fit
 
@@ -528,14 +549,28 @@ class SegTree(BaseEstimator):
         # ``Xraw[:, num_feats].astype(float64)`` would allocate an extra
         # n x n_num x 8-byte temporary (multiple GB on 800k x 300).
         dtype = np.dtype(self.dtype)
+        self._dtype_ = dtype
         mean64 = np.empty(n_num, dtype=np.float64) if n_num else np.zeros(0)
         for pos, j in enumerate(num_feats):
             mean64[pos] = np.mean(Xraw[:, int(j)], dtype=np.float64)
         self._mean_ = mean64
         self._cat_codes_ = {j: cat_codes[j]["column"] for j in sorted(cat_set)}  # int64, exact
-        XcT_num = np.zeros((n_num, n), dtype=dtype) if n_num else np.zeros((0, n), dtype=dtype)
-        for pos, j in enumerate(num_feats):
-            XcT_num[pos] = Xraw[:, int(j)].astype(np.float64, copy=False) - mean64[pos]
+        # The exact path always needs the full centered matrix.  The histogram
+        # path keeps it only while it fits the budget; larger matrices are
+        # centered column-by-column on demand (same values, ~half peak RSS).
+        centered_bytes = n_num * n * dtype.itemsize
+        keep_centered = (
+            self.splitter_ == "exact"
+            or (not self.low_memory and centered_bytes <= _CENTERED_COPY_BYTES)
+            or n_num == 0
+        )
+        if keep_centered:
+            XcT_num = np.zeros((n_num, n), dtype=dtype) if n_num else np.zeros((0, n), dtype=dtype)
+            for pos, j in enumerate(num_feats):
+                XcT_num[pos] = Xraw[:, int(j)].astype(np.float64, copy=False) - mean64[pos]
+        else:
+            XcT_num = None
+        self._centered_numeric_ = keep_centered
         self._XcT_num_ = XcT_num
         # Categorical columns are accessed through the exact int64 code
         # arrays; no float64 copy is kept (it would collapse codes above
@@ -544,8 +579,16 @@ class SegTree(BaseEstimator):
         self._stage64 = dtype == np.float64
 
         root_var = np.zeros(n_num, dtype=np.float64)
-        for pos in range(n_num):
-            root_var[pos] = np.var(XcT_num[pos], dtype=np.float64)
+        if XcT_num is not None:
+            for pos in range(n_num):
+                root_var[pos] = np.var(XcT_num[pos], dtype=np.float64)
+        else:
+            for pos, j in enumerate(num_feats):
+                vals = Xraw[:, int(j)].astype(np.float64, copy=False) - mean64[pos]
+                if dtype != np.float64:
+                    # Match the centered-matrix path, which rounds to dtype.
+                    vals = vals.astype(dtype).astype(np.float64)
+                root_var[pos] = np.var(vals, dtype=np.float64)
         self.root_variances_ = root_var.copy()
         root_var = np.maximum(root_var, _VAR_EPS)
         self._root_var_ = root_var
@@ -573,8 +616,9 @@ class SegTree(BaseEstimator):
 
         if self.splitter_ == "hist":
             # The histogram path reads the caller's matrix directly while
-            # building bins; no full dtype-cast copy is kept afterwards.
-            self._Xraw = None
+            # building bins.  In on-demand centering mode it keeps a reference
+            # for the duration of fit only (cleared below).
+            self._Xraw = None if XcT_num is not None else Xraw
             self._build_histogram_state(Xraw, num_feats, cat_feats)
             self._bufs_ = {}
             self._num_blocks_ = []
@@ -1454,6 +1498,8 @@ class SegTree(BaseEstimator):
             raise ValueError("verbose must be an int >= 0.")
         if self.verbose < 0:
             raise ValueError("verbose must be an int >= 0.")
+        if not isinstance(self.low_memory, (bool, np.bool_)):
+            raise ValueError("low_memory must be a bool.")
         rs = self.random_state
         if rs is not None and not (
             isinstance(rs, (Integral, np.random.Generator)) and not isinstance(rs, bool)
@@ -1756,6 +1802,11 @@ class SegTree(BaseEstimator):
         deterministic stride aliases with periodic columns — e.g. alternating
         0/1 with an even step would sample one phase only and collapse every
         value into a single bin.
+
+        The linear-interpolation quantiles are computed from one sorted
+        sample instead of calling :func:`numpy.quantile`: ``np.sort`` is
+        several times faster than the multi-quantile partition path for the
+        small number of quantiles used here (and yields identical values).
         """
         n = int(col.size)
         if n < 2:
@@ -1771,7 +1822,14 @@ class SegTree(BaseEstimator):
         qs = np.linspace(0.0, 1.0, int(max_bins) + 1)[1:-1]
         if qs.size == 0:
             return np.empty(0, dtype=np.float64)
-        edges = np.unique(np.quantile(sample.astype(np.float64, copy=False), qs))
+        sample64 = np.sort(sample.astype(np.float64, copy=False))
+        # Linear interpolation, matching numpy.quantile's default method.
+        pos = qs * (sample64.size - 1)
+        lower = np.floor(pos).astype(np.intp)
+        upper = np.minimum(lower + 1, sample64.size - 1)
+        frac = pos - lower
+        edges = sample64[lower] + frac * (sample64[upper] - sample64[lower])
+        edges = np.unique(edges)
         return np.asarray(edges, dtype=np.float64)
 
     def _build_histogram_state(self, Xraw: NDArray, num_feats: NDArray, cat_feats: NDArray) -> None:
@@ -1787,10 +1845,9 @@ class SegTree(BaseEstimator):
             # Bin on the same dtype-cast values used by ``predict`` so a
             # float64 -> float32 boundary never routes differently.
             col = np.asarray(Xraw[:, int(j)]).astype(dtype, copy=False)
-            col64 = col.astype(np.float64, copy=False)
             if int(j) in self._binary_set_:
-                lo = float(col64.min())
-                hi = float(col64.max())
+                lo = float(col.min())
+                hi = float(col.max())
                 if hi > lo:
                     # Match the exact path's single 0.5 test for {0, 1}
                     # columns; fall back to the midpoint for other binary
@@ -1800,7 +1857,7 @@ class SegTree(BaseEstimator):
                 else:
                     edges = np.empty(0, dtype=np.float64)
             else:
-                edges = self._quantile_edges(col64, max_bins)
+                edges = self._quantile_edges(col, max_bins)
             # Quantize edges to the working dtype *before* computing bins and
             # before storing thresholds: predict compares dtype-cast values
             # against these thresholds, so an interpolated float64 quantile
@@ -1827,7 +1884,9 @@ class SegTree(BaseEstimator):
         """
         n, m = Xraw.shape
         n_num = int(num_feats.size)
-        assoc = np.zeros((m, m), dtype=np.float64)
+        # Only the row sums are consumed by the split score.  Accumulating
+        # them directly avoids the full F x F matrix (800 MB at 10k columns).
+        assoc_sum = np.zeros(m, dtype=np.float64)
         rng = self._resolve_rng()
         # Bound the sample matrix (rows x n_num) to a few million cells.
         max_rows = min(_ASSOC_SAMPLE_ROWS, max(1_000, 4_000_000 // max(n_num, 1)))
@@ -1849,11 +1908,18 @@ class SegTree(BaseEstimator):
             Z = Xn - mu.astype(np.float32)
             Z /= safe
             Z[:, sd <= _VAR_EPS] = 0.0
-            corr = (Z.T @ Z).astype(np.float64) / Ns
-            np.clip(corr, -1.0, 1.0, out=corr)
-            r2 = corr * corr
-            np.fill_diagonal(r2, 0.0)
-            assoc[np.ix_(num_feats, num_feats)] = r2
+            block = max(1, min(n_num, int(_ASSOC_BLOCK_BYTES // max(1, 8 * n_num))))
+            for start in range(0, n_num, block):
+                stop = min(start + block, n_num)
+                block_corr = (Z[:, start:stop].T @ Z).astype(np.float64) / Ns
+                np.clip(block_corr, -1.0, 1.0, out=block_corr)
+                block_corr *= block_corr
+                local = np.arange(stop - start)
+                block_corr[local, start + local] = 0.0
+                # Row sums over the full column axis; each feature's row is
+                # completed exactly once (in the block that owns it).
+                assoc_sum[num_feats[start:stop]] += block_corr.sum(axis=1)
+                del block_corr
             del Z
 
         # Column totals are independent of the categorical column; compute
@@ -1884,8 +1950,8 @@ class SegTree(BaseEstimator):
                 denom = total_sq - total * total / Ns
                 eta2 = 0.0 if denom <= _VAR_EPS else (between - total * total / Ns) / denom
                 eta2 = float(np.clip(eta2, 0.0, 1.0))
-                assoc[j, int(fj)] = eta2
-                assoc[int(fj), j] = eta2
+                assoc_sum[j] += eta2
+                assoc_sum[int(fj)] += eta2
 
         cats = [int(j) for j in cat_feats]
         for a_idx, j1 in enumerate(cats):
@@ -1908,21 +1974,39 @@ class SegTree(BaseEstimator):
                 chi2 += float(Ns - expected.sum())
                 denom = Ns * min(k1 - 1, k2 - 1)
                 v2 = float(np.clip(chi2 / denom, 0.0, 1.0)) if denom > 0 else 0.0
-                assoc[j1, j2] = v2
-                assoc[j2, j1] = v2
+                assoc_sum[j1] += v2
+                assoc_sum[j2] += v2
 
         if m <= 1:
             return np.zeros(m, dtype=np.float64)
         # Sum (not mean) of squared associations: it approximates how many
         # other features a split on column j also explains, matching the
         # scale of the exact sum-over-features heterogeneity gain.
-        return assoc.sum(axis=1)
+        return assoc_sum
 
     def _column_values(self, j: int) -> NDArray:
         """Full-column training values used for the initial sort orders."""
         if j in self._cat_set_:
             return self._cat_codes_[j]
         return self._XcT_num_[self._num_pos_[j]]
+
+    def _num_values(self, pos: int, idx: NDArray) -> NDArray[np.float64]:
+        """Centered float64 values of numeric feature ``pos`` for rows ``idx``.
+
+        Uses the persistent centered matrix when it exists.  On the
+        memory-bounded histogram path it gathers from the caller's matrix and
+        subtracts the feature mean instead.  For float32 fits the result is
+        rounded to the working dtype before the float64 cast, exactly matching
+        the values that would have been stored in the centered matrix.
+        """
+        if self._XcT_num_ is not None:
+            return self._XcT_num_[pos][idx].astype(np.float64, copy=False)
+        j = int(self._num_feats_[pos])
+        vals = np.asarray(self._Xraw[:, j][idx], dtype=np.float64)
+        vals -= self._mean_[pos]
+        if self._dtype_ != np.float64:
+            vals = vals.astype(self._dtype_).astype(np.float64)
+        return vals
 
     def _row_weight(self, idx: NDArray) -> float:
         if self._sw_ is None:
@@ -2083,11 +2167,13 @@ class SegTree(BaseEstimator):
             # A zero-gain "split" is meaningless even when min_gain == 0.
             return best if best is not None and best["gain"] > 0.0 else None
         candidates.sort(key=lambda c: c["gain"], reverse=True)
+        top = candidates[:4]
+        gains = self._hist_local_cross_gains(top, idx, n, sw_node)
         best = None
-        for cand in candidates[:4]:
+        for cand, gain in zip(top, gains):
             verified = dict(cand)
             verified["proxy_gain"] = cand["gain"]
-            verified["gain"] = self._hist_local_cross_gain(cand, idx, n, sw_node)
+            verified["gain"] = gain
             if self._better_gain(verified, best):
                 best = verified
         return best if best is not None and best["gain"] > 0.0 else None
@@ -2095,8 +2181,13 @@ class SegTree(BaseEstimator):
     def _hist_local_cross_gain(
         self, cand: dict, idx: NDArray, n: int, sw_node: NDArray | None
     ) -> float:
-        """Node-local heterogeneity drop contributed by features *other* than
-        the split feature.
+        """Single-candidate wrapper around :meth:`_hist_local_cross_gains`."""
+        return self._hist_local_cross_gains([cand], idx, n, sw_node)[0]
+
+    def _hist_local_cross_gains(
+        self, cands: Sequence[dict], idx: NDArray, n: int, sw_node: NDArray | None
+    ) -> list[float]:
+        """Score several candidates against the *other* features at once.
 
         A variance-based criterion always credits a median cut with ~64% of
         the split column's variance, even under pure noise.  Requiring that
@@ -2104,89 +2195,103 @@ class SegTree(BaseEstimator):
         node is what distinguishes a real segment boundary from an arbitrary
         cut.  The result is normalized like the exact mixed gain (divided by
         the number of features or total feature weight).
-        """
-        j = int(cand["feat"])
-        if cand["kind"] == "subset":
-            go_left = np.isin(self._cat_codes_[j][idx], tuple(cand["cats"]))
-        else:
-            go_left = self._bin_codes_[self._num_pos_[j]][idx] <= int(cand["bin"])
-        n_left = int(go_left.sum())
-        if n_left == 0 or n_left == n:
-            return 0.0
-        if sw_node is None:
-            w_l, w_r, w_tot = float(n_left), float(n - n_left), float(n)
-            sw_l = sw_r = None
-        else:
-            sw_l = sw_node[go_left]
-            sw_r = sw_node[~go_left]
-            w_l = float(sw_l.sum())
-            w_r = float(sw_r.sum())
-            w_tot = w_l + w_r
-        if w_tot <= _VAR_EPS or w_l <= _VAR_EPS or w_r <= _VAR_EPS:
-            return 0.0
 
-        cross = 0.0
+        The four candidate masks are applied with two matrix-vector products
+        per feature (``W @ vals`` / ``W @ vals**2`` for the left and right
+        sides).  This replaces the per-candidate boolean-index copies and
+        Python loop over features, which dominated wide-data fits, while
+        keeping the per-node memory bounded (``2 * n_candidates * n`` floats).
+        """
+        n_cand = len(cands)
+        if n_cand == 0:
+            return []
+        cand_feats = np.fromiter((int(cand["feat"]) for cand in cands), dtype=np.intp, count=n_cand)
+        left = np.empty((n_cand, n), dtype=bool)
+        for c, cand in enumerate(cands):
+            j = int(cand["feat"])
+            if cand["kind"] == "subset":
+                left[c] = np.isin(self._cat_codes_[j][idx], tuple(cand["cats"]))
+            else:
+                left[c] = self._bin_codes_[self._num_pos_[j]][idx] <= int(cand["bin"])
+        n_left = left.sum(axis=1)
+        if sw_node is None:
+            w_l = n_left.astype(np.float64)
+            w_r = float(n) - w_l
+            w_tot = np.full(n_cand, float(n), dtype=np.float64)
+            W = left.astype(np.float64)
+            Wr = 1.0 - W
+            n_eff = np.full(n_cand, float(n), dtype=np.float64)
+        else:
+            W = left * sw_node[None, :]
+            Wr = sw_node[None, :] - W
+            w_l = W.sum(axis=1)
+            w_r = Wr.sum(axis=1)
+            w_tot = w_l + w_r
+            n_eff = w_tot * w_tot / max(float(np.dot(sw_node, sw_node)), _VAR_EPS)
+        valid = (n_left > 0) & (n_left < n) & (w_tot > _VAR_EPS) & (w_l > _VAR_EPS)
+        valid &= w_r > _VAR_EPS
+        if not valid.any():
+            return [0.0] * n_cand
+
+        w_l_safe = np.maximum(w_l, _VAR_EPS)
+        w_r_safe = np.maximum(w_r, _VAR_EPS)
+        # Left and right indicator (or sample-weight) rows in one matrix, so
+        # each feature costs two BLAS products instead of 8 boolean gathers.
+        WLR = np.concatenate([W, Wr], axis=0)
+        cross = np.zeros(n_cand, dtype=np.float64)
+
         for pos, fj in enumerate(self._num_feats_):
             fj = int(fj)
-            if fj == j:
-                continue
-            vals = self._XcT_num_[pos][idx].astype(np.float64, copy=False)
-            vl = vals[go_left]
-            vr = vals[~go_left]
-            if sw_node is None:
-                sl, sr = float(vl.sum()), float(vr.sum())
-                ql, qr = float(np.dot(vl, vl)), float(np.dot(vr, vr))
-            else:
-                sl, sr = float(np.dot(vl, sw_l)), float(np.dot(vr, sw_r))
-                ql, qr = float(np.dot(vl * vl, sw_l)), float(np.dot(vr * vr, sw_r))
+            vals = self._num_values(pos, idx)
+            sums = WLR @ vals
+            sqs = WLR @ (vals * vals)
+            sl, sr = sums[:n_cand], sums[n_cand:]
+            ql, qr = sqs[:n_cand], sqs[n_cand:]
             s_tot, q_tot = sl + sr, ql + qr
-            var_tot = max(q_tot / w_tot - (s_tot / w_tot) ** 2, 0.0)
-            var_l = max(ql / w_l - (sl / w_l) ** 2, 0.0)
-            var_r = max(qr / w_r - (sr / w_r) ** 2, 0.0)
+            var_tot = np.maximum(q_tot / w_tot - (s_tot / w_tot) ** 2, 0.0)
+            var_l = np.maximum(ql / w_l_safe - (sl / w_l_safe) ** 2, 0.0)
+            var_r = np.maximum(qr / w_r_safe - (sr / w_r_safe) ** 2, 0.0)
             delta = var_tot - (w_l / w_tot) * var_l - (w_r / w_tot) * var_r
-            ratio = max(delta, 0.0) / self._root_var_[pos]
+            ratio = np.maximum(delta, 0.0) / self._root_var_[pos]
+            ratio[cand_feats == fj] = 0.0
             cross += ratio * (self._w_all_[fj] if self._weighted_ else 1.0)
 
         for cj in self._cat_set_:
             cj = int(cj)
-            if cj == j:
-                continue
             meta = self._cat_meta_[cj]
             local = np.searchsorted(meta["codes"], self._cat_codes_[cj][idx])
+            k_cat = int(meta["k"])
             if sw_node is None:
-                cnt = np.bincount(local, minlength=meta["k"]).astype(np.float64)
-                cnt_l = np.bincount(local[go_left], minlength=meta["k"]).astype(np.float64)
-                cnt_r = np.bincount(local[~go_left], minlength=meta["k"]).astype(np.float64)
+                cnt = np.bincount(local, minlength=k_cat).astype(np.float64)
             else:
-                cnt = np.bincount(local, weights=sw_node, minlength=meta["k"])
-                cnt_l = np.bincount(local[go_left], weights=sw_l, minlength=meta["k"])
-                cnt_r = np.bincount(local[~go_left], weights=sw_r, minlength=meta["k"])
-
-            def _gini(c: NDArray, total: float) -> float:
-                c = c[c > 0]
-                if total <= _VAR_EPS:
-                    return 0.0
-                p = c / total
-                return float(1.0 - np.sum(p * p))
-
-            g_tot = _gini(cnt, w_tot)
-            g_l = _gini(cnt_l, w_l)
-            g_r = _gini(cnt_r, w_r)
+                cnt = np.bincount(local, weights=sw_node, minlength=k_cat)
+            cnt_l = np.empty((n_cand, k_cat), dtype=np.float64)
+            cnt_r = np.empty((n_cand, k_cat), dtype=np.float64)
+            for c in range(n_cand):
+                cnt_l[c] = np.bincount(local, weights=W[c], minlength=k_cat)
+                cnt_r[c] = np.bincount(local, weights=Wr[c], minlength=k_cat)
+            np.maximum(cnt_l, 0.0, out=cnt_l)
+            np.maximum(cnt_r, 0.0, out=cnt_r)
+            p_tot = cnt[None, :] / w_tot[:, None]
+            g_tot = 1.0 - np.sum(p_tot * p_tot, axis=1)
+            p_l = cnt_l / w_l_safe[:, None]
+            p_r = cnt_r / w_r_safe[:, None]
+            g_l = 1.0 - np.sum(p_l * p_l, axis=1)
+            g_r = 1.0 - np.sum(p_r * p_r, axis=1)
             delta = g_tot - (w_l / w_tot) * g_l - (w_r / w_tot) * g_r
-            ratio = max(delta, 0.0) / self._root_gini_[cj]
+            ratio = np.maximum(delta, 0.0) / self._root_gini_[cj]
+            ratio[cand_feats == cj] = 0.0
             cross += ratio * (self._w_all_[cj] if self._weighted_ else 1.0)
 
         denom = self._w_sum_ if self._weighted_ else float(self.n_features_in_)
-        gain = float(cross) / denom
+        gain = cross / denom
         # Under a random split, every *other* feature loses ~1/n_eff of its
         # variance to between-group noise.  Summed over features this is a
         # predictable floor, not structure; subtract it so deeper nodes
         # (where 1/n_node grows) do not start splitting noise.
-        if sw_node is None:
-            n_eff = float(n)
-        else:
-            n_eff = float(w_tot * w_tot / max(float(np.dot(sw_node, sw_node)), _VAR_EPS))
-        return max(gain - 1.0 / max(n_eff, 1.0), 0.0)
+        gain = np.maximum(gain - 1.0 / np.maximum(n_eff, 1.0), 0.0)
+        gain[~valid] = 0.0
+        return [float(value) for value in gain]
 
     def _hist_assoc(self, j: int) -> float:
         """Sum of squared associations of feature ``j`` with the others."""
@@ -2219,10 +2324,14 @@ class SegTree(BaseEstimator):
         if q < 2:
             return None
         bins = self._bin_codes_[pos][idx]
-        vals = self._XcT_num_[pos][idx].astype(np.float64, copy=False)
-        counts = np.bincount(bins, minlength=q).astype(np.float64)
-        if not counts.any():
-            return None
+        # ``np.bincount`` casts non-intp codes internally on every call, which
+        # is ~3x slower for uint8 histogram codes.  Converting once per feature
+        # here is cheaper than three internal casts and keeps the persistent
+        # bin matrix at one byte per value.
+        if bins.dtype != np.intp:
+            bins = bins.astype(np.intp)
+        vals = self._num_values(pos, idx)
+        counts = np.bincount(bins, minlength=q)
         if sw_node is None:
             weights = counts
             sums = np.bincount(bins, weights=vals, minlength=q)
@@ -2880,10 +2989,10 @@ class SegTree(BaseEstimator):
             ratios = np.empty(self._n_num_, dtype=np.float64)
             if sw_node is None:
                 for pos in range(self._n_num_):
-                    ratios[pos] = np.var(self._XcT_num_[pos][idx], dtype=np.float64)
+                    ratios[pos] = np.var(self._num_values(pos, idx), dtype=np.float64)
             else:
                 for pos in range(self._n_num_):
-                    vals = self._XcT_num_[pos][idx].astype(np.float64, copy=False)
+                    vals = self._num_values(pos, idx)
                     mean_w = np.average(vals, weights=sw_node)
                     ratios[pos] = np.average((vals - mean_w) ** 2, weights=sw_node)
             num_ratio = float(self._num_reduce(np.maximum(ratios, 0.0) / self._root_var_, axis=0))

@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.6.1 — 2026-10-26
+
+Fit time on the default histogram path improved by roughly 2.4–2.8× on
+typical tall/wide tables, and peak memory no longer contains a full
+`n_features²` association matrix.
+
+### Speed
+
+- **Quantile edges** are computed from one sorted sample with explicit linear
+  interpolation instead of `numpy.quantile` over ~`max_bins` quantiles.
+  `np.sort` is ~4× faster than the multi-quantile `partition` path here; the
+  resulting edges are identical.
+- **Cross-feature candidate verification** now scores all top-four candidates
+  together. Each numeric feature costs two matrix-vector products against a
+  `2·n_candidates × n_node` indicator matrix instead of four separate
+  boolean-index copies and Python loops. This was ~60% of fit time on wide
+  data.
+- Histogram bin codes are cast to `intp` once per feature before three
+  `bincount` calls (`np.bincount` internally recasts `uint8` on every call).
+- Unweighted histogram counts stay integer until the variance arithmetic,
+  removing an extra allocation per feature and node.
+- Same-machine before/after on identical synthetic data (3 signal columns +
+  noise; float64 except the f32 row):
+
+  | shape | 0.6.0 | optimized |
+  |---|---|---|
+  | 20k × 50 | 0.31 s | 0.11 s |
+  | 60k × 300 | 3.0 s | 1.2 s |
+  | 150k × 300 | 8.0 s | 3.1 s |
+  | 300k × 300 | 16.5 s | 6.8 s |
+  | 829k × 301 (f32) | 51.8 s | 21.8 s |
+  | 500k × 30 | 3.4 s | 1.4 s |
+  | 5,000 × 2,000 | 1.4 s | 0.9 s |
+  | 2,000 × 10,000 | 5.3 s | 3.8 s |
+
+### Memory
+
+- **Association row sums are accumulated blockwise** (≤32 MiB working set)
+  and the full `F × F` matrix is never allocated. This drops peak fit memory
+  on 2,000 × 10,000 from 2.54 GB to 318 MB (tracemalloc).
+- The histogram path keeps its centered numeric copy only when it fits a
+  1 GiB budget; larger matrices center each gathered column on demand. The
+  copy itself never exceeds what 0.6.0 always retained; the batched and
+  blockwise temporaries add only tens of MiB.
+- New **`low_memory=True`** parameter forces the on-demand path. On
+  829k × 301 (f32) fit memory drops from ~1.3 GB to ~0.38 GB beyond the
+  input (≈36 s vs ≈22 s).
+
+### Tests
+
+- 8 new tests in `tests/test_performance_optimizations.py`: sorted-sample
+  quantiles vs `numpy.quantile`, cached vs on-demand centering (float64 and
+  float32), the `low_memory` switch and validation, blockwise vs single-block
+  association, and batched vs single-candidate cross-feature scores.
+- Existing 179 tests and the independent naive-reference/differential suites
+  pass unchanged; deterministic structural golden results (cuts, thresholds,
+  labels, gains, importances) are unchanged.
+
 ## 0.6.0 — 2026-10-19
 
 Scalability and robustness release driven by 16 production issues reproduced
